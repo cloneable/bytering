@@ -3,6 +3,14 @@ name = "bytering"
 version = "0.1.0"
 edition = "2021"
 
+description = "A ring buffer for vectored writing and reading"
+authors = ["Folke <folke@gmail.com>"]
+license = "MIT OR Apache-2.0"
+
+categories = ["data-structures"]
+keywords = []
+repository = "https://github.com/cloneable/bytering"
+
 [dependencies]
 futures-io = "0.3"
 
