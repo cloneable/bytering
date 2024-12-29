@@ -2,18 +2,20 @@
 name = "bytering"
 version = "0.2.0"
 edition = "2021"
-
 description = "A ring buffer specialized for vectored reading and writing in blocking and async I/O"
 authors = ["Folke <folke@gmail.com>"]
 license = "MIT OR Apache-2.0"
-
 categories = ["data-structures"]
 keywords = []
 repository = "https://github.com/cloneable/bytering"
-
-[dependencies]
-futures-io = "0.3"
+exclude = [".gitignore", "examples"]
 
 [features]
-default = ["std"]
-std = []
+default = ["std", "tokio1", "futures0"]
+std = ["futures-io?/std"]
+futures0 = ["dep:futures-io", "std"]
+tokio1 = ["dep:tokio", "std"]
+
+[dependencies]
+futures-io = { version = "0.3", default-features = false, features = [], optional = true }
+tokio = { version = "1", default-features = false, features = [], optional = true }

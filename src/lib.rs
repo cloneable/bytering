@@ -10,19 +10,23 @@
     clippy::use_self,
     // API may still change.
     clippy::missing_const_for_fn,
-
-    // TODO: fix
-    clippy::future_not_send,
 )]
+#![cfg_attr(not(feature = "std"), no_std)]
+#![no_implicit_prelude]
 
-use core::{
-    future::poll_fn,
+extern crate alloc;
+
+use ::alloc::{boxed::Box, vec};
+use ::core::{
+    assert, debug_assert,
+    future::{poll_fn, Future},
+    marker::{Send, Sized, Unpin},
     pin::Pin,
+    result::Result::Ok,
     task::{ready, Context, Poll},
 };
-use std::io::{self, IoSlice, IoSliceMut};
-
-use futures_io::{AsyncRead, AsyncWrite};
+#[cfg(feature = "std")]
+use ::std::io;
 
 pub struct Buffer {
     /// Absolute counter of bytes read from the buffer whose modulus is the
@@ -129,9 +133,9 @@ impl Buffer {
     /// read.
     #[must_use]
     #[inline]
-    pub fn read_io_slices(&self) -> [IoSlice<'_>; 2] {
+    pub fn read_io_slices(&self) -> [io::IoSlice<'_>; 2] {
         let [a, b] = self.read_slices();
-        [IoSlice::new(a), IoSlice::new(b)]
+        [io::IoSlice::new(a), io::IoSlice::new(b)]
     }
 
     /// Advances the internal read position.
@@ -194,9 +198,9 @@ impl Buffer {
     /// they should be zeroed first.
     #[must_use]
     #[inline]
-    pub fn write_io_slices(&mut self) -> [IoSliceMut<'_>; 2] {
+    pub fn write_io_slices(&mut self) -> [io::IoSliceMut<'_>; 2] {
         let [a, b] = self.write_slices();
-        [IoSliceMut::new(a), IoSliceMut::new(b)]
+        [io::IoSliceMut::new(a), io::IoSliceMut::new(b)]
     }
 
     /// Advances the internal write position.
@@ -217,8 +221,35 @@ impl Buffer {
         );
         self.write = new_write;
     }
+}
 
-    /// Attempts to read from the [`AsyncRead`].
+#[cfg(feature = "std")]
+pub trait StdIoBuf {
+    fn read_from<R: io::Read + ?Sized>(&mut self, read: &mut R) -> io::Result<usize>;
+
+    fn write_to<W: io::Write + ?Sized>(&mut self, write: &mut W) -> io::Result<usize>;
+}
+
+#[cfg(feature = "std")]
+impl StdIoBuf for Buffer {
+    #[inline]
+    fn read_from<R: io::Read + ?Sized>(&mut self, read: &mut R) -> io::Result<usize> {
+        let n = read.read_vectored(&mut self.write_io_slices())?;
+        self.write_advance(n);
+        Ok(n)
+    }
+
+    #[inline]
+    fn write_to<W: io::Write + ?Sized>(&mut self, write: &mut W) -> io::Result<usize> {
+        let n = write.write_vectored(&self.read_io_slices())?;
+        self.read_advance(n);
+        Ok(n)
+    }
+}
+
+#[cfg(feature = "futures0")]
+pub trait FuturesIoBuf {
+    /// Attempts to read from the [`::futures_io::AsyncRead`].
     ///
     /// Returns [`Poll::Pending`] if nothing can be read at the moment.
     /// Returns [`Poll::Ready`] with [`Ok`] and the
@@ -228,16 +259,11 @@ impl Buffer {
     /// # Errors
     ///
     /// On error, [`Err`] returns the I/O error from the [`AsyncRead`].
-    #[inline]
-    pub fn poll_read_from<R: AsyncRead + ?Sized>(
-        mut self: Pin<&mut Self>,
+    fn poll_read_from<R: ::futures_io::AsyncRead + ?Sized>(
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         read: Pin<&mut R>,
-    ) -> Poll<io::Result<usize>> {
-        let n = ready!(read.poll_read_vectored(cx, &mut self.write_io_slices()))?;
-        self.write_advance(n);
-        Poll::Ready(Ok(n))
-    }
+    ) -> Poll<io::Result<usize>>;
 
     /// Reads from the [`AsyncRead`].
     ///
@@ -247,14 +273,10 @@ impl Buffer {
     /// # Errors
     ///
     /// On error, [`Err`] returns the I/O error from the [`AsyncRead`].
-    #[inline]
-    pub async fn read_from<R: AsyncRead + Unpin + ?Sized>(
+    fn read_from<R: ::futures_io::AsyncRead + ?Sized + Unpin>(
         &mut self,
-        mut read: &mut R,
-    ) -> io::Result<usize> {
-        let mut this = Pin::new(self);
-        poll_fn(|cx| this.as_mut().poll_read_from(cx, Pin::new(&mut read))).await
-    }
+        read: &mut R,
+    ) -> impl Future<Output = io::Result<usize>>;
 
     /// Attempts to write to the [`AsyncWrite`].
     ///
@@ -266,16 +288,11 @@ impl Buffer {
     /// # Errors
     ///
     /// On error, [`Err`] returns the I/O error from the [`AsyncWrite`].
-    #[inline]
-    pub fn poll_write_to<W: AsyncWrite + ?Sized>(
-        mut self: Pin<&mut Self>,
+    fn poll_write_to<W: ::futures_io::AsyncWrite + ?Sized>(
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         write: Pin<&mut W>,
-    ) -> Poll<io::Result<usize>> {
-        let n = ready!(write.poll_write_vectored(cx, &self.read_io_slices()))?;
-        self.read_advance(n);
-        Poll::Ready(Ok(n))
-    }
+    ) -> Poll<io::Result<usize>>;
 
     /// Writes to the [`AsyncWrite`].
     ///
@@ -285,19 +302,114 @@ impl Buffer {
     /// # Errors
     ///
     /// On error, [`Err`] returns the I/O error from the [`AsyncWrite`].
+    fn write_to<W: ::futures_io::AsyncWrite + ?Sized + Unpin>(
+        &mut self,
+        write: &mut W,
+    ) -> impl Future<Output = io::Result<usize>>;
+}
+
+#[cfg(feature = "futures0")]
+impl FuturesIoBuf for Buffer {
     #[inline]
-    pub async fn write_to<W: AsyncWrite + Unpin + ?Sized>(
+    fn poll_read_from<R: ::futures_io::AsyncRead + ?Sized>(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        read: Pin<&mut R>,
+    ) -> Poll<io::Result<usize>> {
+        let n = ready!(read.poll_read_vectored(cx, &mut self.write_io_slices()))?;
+        self.write_advance(n);
+        Poll::Ready(Ok(n))
+    }
+
+    #[inline]
+    async fn read_from<R: ::futures_io::AsyncRead + Unpin + ?Sized>(
+        &mut self,
+        mut read: &mut R,
+    ) -> io::Result<usize> {
+        poll_fn(move |cx| FuturesIoBuf::poll_read_from(Pin::new(self), cx, Pin::new(&mut read)))
+            .await
+    }
+
+    #[inline]
+    fn poll_write_to<W: ::futures_io::AsyncWrite + ?Sized>(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        write: Pin<&mut W>,
+    ) -> Poll<io::Result<usize>> {
+        let n = ready!(write.poll_write_vectored(cx, &self.read_io_slices()))?;
+        self.read_advance(n);
+        Poll::Ready(Ok(n))
+    }
+
+    #[inline]
+    fn write_to<W: ::futures_io::AsyncWrite + Unpin + ?Sized>(
         &mut self,
         mut write: &mut W,
-    ) -> io::Result<usize> {
-        let mut this = Pin::new(self);
-        poll_fn(|cx| this.as_mut().poll_write_to(cx, Pin::new(&mut write))).await
+    ) -> impl Future<Output = io::Result<usize>> {
+        poll_fn(move |cx| FuturesIoBuf::poll_write_to(Pin::new(self), cx, Pin::new(&mut write)))
+    }
+}
+
+#[cfg(feature = "tokio1")]
+pub trait TokioBuf {
+    // TODO: vectored read?
+
+    /// Attempts to write to the [`AsyncWrite`].
+    ///
+    /// Returns [`Poll::Pending`] if nothing can be written at the moment.
+    /// Returns [`Poll::Ready`] with [`Ok`] and the
+    /// number of bytes written on success.
+    /// (The internal write position is advanced implicitly on successful write.)
+    ///
+    /// # Errors
+    ///
+    /// On error, [`Err`] returns the I/O error from the [`AsyncWrite`].
+    fn poll_write_to<W: ::tokio::io::AsyncWrite + Send + ?Sized>(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        write: Pin<&mut W>,
+    ) -> Poll<io::Result<usize>>;
+
+    /// Writes to the [`AsyncWrite`].
+    ///
+    /// Returns [`Ok`] and the number of bytes written on success.
+    /// (The internal write position is advanced implicitly.)
+    ///
+    /// # Errors
+    ///
+    /// On error, [`Err`] returns the I/O error from the [`AsyncWrite`].
+    fn write_to<W: ::tokio::io::AsyncWrite + Send + ?Sized + Unpin>(
+        &mut self,
+        write: &mut W,
+    ) -> impl Future<Output = io::Result<usize>> + Send;
+}
+
+#[cfg(feature = "tokio1")]
+impl TokioBuf for Buffer {
+    #[inline]
+    fn poll_write_to<W: ::tokio::io::AsyncWrite + Send + ?Sized>(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        write: Pin<&mut W>,
+    ) -> Poll<io::Result<usize>> {
+        let n = ready!(write.poll_write_vectored(cx, &self.read_io_slices()))?;
+        self.read_advance(n);
+        Poll::Ready(Ok(n))
+    }
+
+    #[inline]
+    fn write_to<W: ::tokio::io::AsyncWrite + Send + ?Sized + Unpin>(
+        &mut self,
+        write: &mut W,
+    ) -> impl Future<Output = io::Result<usize>> + Send {
+        poll_fn(move |cx| TokioBuf::poll_write_to(Pin::new(self), cx, Pin::new(write)))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ::core::assert_eq;
 
     #[test]
     fn test_advance() {
