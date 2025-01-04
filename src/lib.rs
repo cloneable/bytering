@@ -11,49 +11,38 @@
     // API may still change.
     clippy::missing_const_for_fn,
 )]
+// TODO: document everything
+#![expect(
+    clippy::undocumented_unsafe_blocks,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc
+)]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![no_implicit_prelude]
 
 extern crate alloc;
 
-use ::alloc::{boxed::Box, vec};
-use ::core::{
-    assert, debug_assert,
-    future::{poll_fn, Future},
-    marker::{Send, Sized, Unpin},
-    pin::Pin,
-    result::Result::Ok,
-    task::{ready, Context, Poll},
-};
+use ::alloc::alloc::{alloc, dealloc, Layout};
+use ::alloc::sync::Arc;
+use ::core::cell::UnsafeCell;
+use ::core::clone::Clone;
+use ::core::convert::{AsMut, AsRef};
+use ::core::marker::{PhantomData, Send, Sync};
+use ::core::ops::{Deref, DerefMut, Drop, FnMut};
+use ::core::ptr::NonNull;
+use ::core::result::Result::{self, Ok};
+use ::core::sync::atomic::AtomicUsize;
+use ::core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use ::core::{assert, assert_eq, slice};
 #[cfg(feature = "std")]
 use ::std::io;
 
+#[derive(Debug)]
 pub struct Buffer {
-    /// Absolute counter of bytes read from the buffer whose modulus is the
-    /// starting offset of readable data. May get reset to 0 when it catches up
-    /// with [`write`](Buffer::write).
-    read: usize,
-    /// Absolute counter of bytes written into the buffer whose modulus is the
-    /// end offset of readable data and the offset where new data is written to.
-    /// May get reset to 0 when [`read`](Buffer::read) catches up.
-    write: usize,
-    /// Bitmask derived from the power-of-2 capacity to quickly calculate the
-    /// [`read`](Buffer::read) and [`write`](Buffer::write) offsets.
-    mask: usize,
-    /// Heap-allocated memory for data.
-    // TODO: page (start) aligned, if possible without unsafe.
-    data: Box<[u8]>,
+    inner: Arc<BufferInner>,
 }
 
 impl Buffer {
-    /// Creates a new fixed-capacity [`Buffer`].
-    ///
-    /// `capacity` must be a power of 2.
-    /// (This requirement may get dropped in a future version.)
-    ///
-    /// # Panics
-    ///
-    /// Will panic if [`capacity`] is not a power of 2.
     #[must_use]
     #[inline]
     pub fn new(capacity: usize) -> Self {
@@ -62,439 +51,260 @@ impl Buffer {
             "capacity is not power of two: {capacity}"
         );
         Buffer {
-            read: 0,
-            write: 0,
-            mask: capacity - 1,
-            data: vec![0u8; capacity].into_boxed_slice(),
+            inner: Arc::new(BufferInner {
+                read: AtomicUsize::new(0),
+                write: AtomicUsize::new(0),
+                mask: capacity - 1,
+                data: UnsafeCell::new(AlignedData::new(capacity, 4096)),
+            }),
         }
     }
 
-    /// Clears the buffer of data.
-    ///
-    /// Does not zero the internal buffer.
-    #[inline]
-    pub fn clear(&mut self) {
-        self.read = 0;
-        self.write = 0;
-    }
-
-    /// Returns the amount of data in the buffer.
     #[must_use]
     #[inline]
-    pub fn len(&self) -> usize {
-        self.write - self.read
-    }
-
-    /// Returns `true` if the buffer contains no data.
-    #[must_use]
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.read == self.write
-    }
-
-    /// The offset of the read position into the internal buffer.
-    #[must_use]
-    #[inline]
-    const fn read_offset(&self) -> usize {
-        self.read & self.mask
-    }
-
-    /// The offset of the write position into the internal buffer.
-    #[must_use]
-    #[inline]
-    const fn write_offset(&self) -> usize {
-        self.write & self.mask
-    }
-
-    /// Returns a pair of byte slices containing the filled data of the buffer.
-    ///
-    /// The second slice or both slices may have a lnegth of 0 when the buffer
-    /// is completely empty.
-    /// After reading [`read_advance`] must be called with the number of bytes
-    /// read.
-    #[must_use]
-    #[inline]
-    pub fn read_slices(&self) -> [&[u8]; 2] {
-        let (read, write) = (self.read_offset(), self.write_offset());
-
-        if read <= write {
-            [&self.data[read..write], &[]]
-        } else {
-            let (b, a) = self.data.split_at(read);
-            [a, &b[..write]]
-        }
-    }
-
-    /// Returns a pair of [`IoSlices`](IoSlice) for reading from this buffer.
-    ///
-    /// The second slice or both slices may have a lnegth of 0 when the buffer
-    /// is completely empty.
-    /// After reading [`read_advance`] must be called with the number of bytes
-    /// read.
-    #[must_use]
-    #[inline]
-    pub fn read_io_slices(&self) -> [io::IoSlice<'_>; 2] {
-        let [a, b] = self.read_slices();
-        [io::IoSlice::new(a), io::IoSlice::new(b)]
-    }
-
-    /// Advances the internal read position.
-    ///
-    /// Must be called after reading from the slices returned by [`read_slices`]
-    /// and [`read_io_slices`].
-    ///
-    /// # Panics
-    ///
-    /// Will panic if [`n`] is higher than number of bytes in buffer.
-    #[inline]
-    pub fn read_advance(&mut self, n: usize) {
-        let new_read = self.read + n;
-        assert!(new_read <= self.write, "read advance out of bounds");
-        if new_read == self.write {
-            // TODO: consider not resetting counters and expose both for stats.
-            self.clear();
-        } else {
-            self.read = new_read;
-        }
-    }
-
-    /// Returns a pair of byte slices containing the empty space of the buffer.
-    ///
-    /// The second slice has a length of 0 when the entire empty segment of
-    /// the buffer can be mapped by the first slice.
-    /// Both slices have a length of 0 when the buffer
-    /// is filled to capacity.
-    /// After writing [`write_advance`] must be called with the number of bytes
-    /// written.
-    ///
-    /// The slices should only be written to and not read from because they
-    /// contain old data. If the slices are passed to an untrusted data source
-    /// they should be zeroed first.
-    #[must_use]
-    #[inline]
-    pub fn write_slices(&mut self) -> [&mut [u8]; 2] {
-        let (read, write) = (self.read_offset(), self.write_offset());
-
-        if read > write {
-            [&mut self.data[write..read], &mut []]
-        } else {
-            let (b, a) = self.data.split_at_mut(write);
-            [a, &mut b[..read]]
-        }
-    }
-
-    /// Returns a pair of [`IoSliceMuts`](IoSliceMut) containing the empty space
-    /// of the buffer.
-    ///
-    /// The second slice has a length of 0 when the entire empty segment of
-    /// the buffer can be mapped by the first slice.
-    /// Both slices have a length of 0 when the buffer
-    /// is filled to capacity.
-    /// After writing [`write_advance`] must be called with the number of bytes
-    /// written.
-    ///
-    /// The slices should only be written to and not read from because they
-    /// contain old data. If the slices are passed to an untrusted data source
-    /// they should be zeroed first.
-    #[must_use]
-    #[inline]
-    pub fn write_io_slices(&mut self) -> [io::IoSliceMut<'_>; 2] {
-        let [a, b] = self.write_slices();
-        [io::IoSliceMut::new(a), io::IoSliceMut::new(b)]
-    }
-
-    /// Advances the internal write position.
-    ///
-    /// Must be called after writing to the slices returned by [`write_slices`]
-    /// and [`write_io_slices`].
-    ///
-    /// # Panics
-    ///
-    /// Will panic if [`n`] is higher than empty capacity in buffer.
-    #[inline]
-    pub fn write_advance(&mut self, n: usize) {
-        debug_assert!(self.read <= self.write);
-        let new_write = self.write + n;
-        assert!(
-            new_write - self.read <= self.data.len(),
-            "write advance out of bounds"
-        );
-        self.write = new_write;
+    pub fn into_parts(self) -> (Reader, Writer) {
+        let reader = Reader {
+            buffer: Arc::clone(&self.inner),
+            _notsync: PhantomData,
+        };
+        let writer = Writer {
+            buffer: self.inner,
+            _notsync: PhantomData,
+        };
+        (reader, writer)
     }
 }
 
-#[cfg(feature = "std")]
-pub trait StdIoBuf {
-    fn read_from<R: io::Read + ?Sized>(&mut self, read: &mut R) -> io::Result<usize>;
-
-    fn write_to<W: io::Write + ?Sized>(&mut self, write: &mut W) -> io::Result<usize>;
+// TODO: put data and counters into same heap allocation.
+#[derive(Debug)]
+struct BufferInner {
+    read: AtomicUsize,
+    write: AtomicUsize,
+    mask: usize,
+    data: UnsafeCell<AlignedData>,
 }
 
-#[cfg(feature = "std")]
-impl StdIoBuf for Buffer {
+// TODO: make data sync, if possible
+unsafe impl Sync for BufferInner {}
+
+impl BufferInner {
+    #[must_use]
     #[inline]
-    fn read_from<R: io::Read + ?Sized>(&mut self, read: &mut R) -> io::Result<usize> {
-        let n = read.read_vectored(&mut self.write_io_slices())?;
-        self.write_advance(n);
+    fn data(&self) -> &[u8] {
+        unsafe { &*(self.data.get()) }
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    #[must_use]
+    #[inline]
+    unsafe fn data_mut(&self) -> &mut [u8] {
+        unsafe { &mut *self.data.get() }
+    }
+
+    #[inline]
+    fn synced_read<E>(
+        &self,
+        mut f: impl FnMut([&mut [u8]; 2], usize) -> Result<usize, E>,
+    ) -> Result<usize, E> {
+        let r = self.read.load(Relaxed);
+        let w = self.write.load(Acquire);
+
+        let (bufs, len) = self.empty_segments(r, w);
+        let n = f(bufs, len)?;
+        assert!(n <= len);
+
+        self.write.store(w + n, Release);
         Ok(n)
     }
 
+    #[must_use]
     #[inline]
-    fn write_to<W: io::Write + ?Sized>(&mut self, write: &mut W) -> io::Result<usize> {
-        let n = write.write_vectored(&self.read_io_slices())?;
-        self.read_advance(n);
+    fn empty_segments(&self, read: usize, write: usize) -> ([&mut [u8]; 2], usize) {
+        let (start, end) = (read & self.mask, write & self.mask);
+        let data = unsafe { self.data_mut() };
+        let len = data.len() - (write - read);
+        if start > end {
+            ([&mut data[end..start], &mut []], len)
+        } else {
+            let (b, a) = data.split_at_mut(end);
+            ([a, &mut b[..start]], len)
+        }
+    }
+
+    #[inline]
+    fn synced_write<E>(
+        &self,
+        mut f: impl FnMut([&[u8]; 2], usize) -> Result<usize, E>,
+    ) -> Result<usize, E> {
+        let r = self.read.load(Relaxed);
+        let w = self.write.load(Acquire);
+
+        let (bufs, len) = self.filled_segments(r, w);
+        let n = f(bufs, len)?;
+        assert!(n <= len);
+
+        self.read.store(r + n, Release);
         Ok(n)
     }
-}
 
-#[cfg(feature = "futures0")]
-pub trait FuturesIoBuf {
-    /// Attempts to read from the [`::futures_io::AsyncRead`].
-    ///
-    /// Returns [`Poll::Pending`] if nothing can be read at the moment.
-    /// Returns [`Poll::Ready`] with [`Ok`] and the
-    /// number of bytes read on success.
-    /// (The internal read position is advanced implicitly on successful read.)
-    ///
-    /// # Errors
-    ///
-    /// On error, [`Err`] returns the I/O error from the [`AsyncRead`].
-    fn poll_read_from<R: ::futures_io::AsyncRead + ?Sized>(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        read: Pin<&mut R>,
-    ) -> Poll<io::Result<usize>>;
-
-    /// Reads from the [`AsyncRead`].
-    ///
-    /// Returns [`Ok`] and the number of bytes read on success.
-    /// (The internal read position is advanced implicitly.)
-    ///
-    /// # Errors
-    ///
-    /// On error, [`Err`] returns the I/O error from the [`AsyncRead`].
-    fn read_from<R: ::futures_io::AsyncRead + ?Sized + Unpin>(
-        &mut self,
-        read: &mut R,
-    ) -> impl Future<Output = io::Result<usize>>;
-
-    /// Attempts to write to the [`AsyncWrite`].
-    ///
-    /// Returns [`Poll::Pending`] if nothing can be written at the moment.
-    /// Returns [`Poll::Ready`] with [`Ok`] and the
-    /// number of bytes written on success.
-    /// (The internal write position is advanced implicitly on successful write.)
-    ///
-    /// # Errors
-    ///
-    /// On error, [`Err`] returns the I/O error from the [`AsyncWrite`].
-    fn poll_write_to<W: ::futures_io::AsyncWrite + ?Sized>(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        write: Pin<&mut W>,
-    ) -> Poll<io::Result<usize>>;
-
-    /// Writes to the [`AsyncWrite`].
-    ///
-    /// Returns [`Ok`] and the number of bytes written on success.
-    /// (The internal write position is advanced implicitly.)
-    ///
-    /// # Errors
-    ///
-    /// On error, [`Err`] returns the I/O error from the [`AsyncWrite`].
-    fn write_to<W: ::futures_io::AsyncWrite + ?Sized + Unpin>(
-        &mut self,
-        write: &mut W,
-    ) -> impl Future<Output = io::Result<usize>>;
-}
-
-#[cfg(feature = "futures0")]
-impl FuturesIoBuf for Buffer {
+    #[must_use]
     #[inline]
-    fn poll_read_from<R: ::futures_io::AsyncRead + ?Sized>(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        read: Pin<&mut R>,
-    ) -> Poll<io::Result<usize>> {
-        let n = ready!(read.poll_read_vectored(cx, &mut self.write_io_slices()))?;
-        self.write_advance(n);
-        Poll::Ready(Ok(n))
+    fn filled_segments(&self, read: usize, write: usize) -> ([&[u8]; 2], usize) {
+        let (start, end) = (read & self.mask, write & self.mask);
+        let data = self.data();
+        let len = write - read;
+        if start < end {
+            ([&data[start..end], &[]], len)
+        } else {
+            let (b, a) = data.split_at(start);
+            ([a, &b[..end]], len)
+        }
     }
+}
 
+#[derive(Debug)]
+pub struct Reader {
+    buffer: Arc<BufferInner>,
+    _notsync: PhantomData<*mut ()>,
+}
+
+unsafe impl Send for Reader {}
+
+impl Reader {
+    #[cfg(feature = "std")]
     #[inline]
-    async fn read_from<R: ::futures_io::AsyncRead + Unpin + ?Sized>(
-        &mut self,
-        mut read: &mut R,
+    pub fn io_read_from(
+        &self,
+        mut f: impl FnMut(&mut [io::IoSliceMut<'_>], usize) -> io::Result<usize>,
     ) -> io::Result<usize> {
-        poll_fn(move |cx| FuturesIoBuf::poll_read_from(Pin::new(self), cx, Pin::new(&mut read)))
-            .await
+        self.buffer.synced_read(|bufs, len| {
+            let mut bufs = bufs.map(io::IoSliceMut::new);
+            f(&mut bufs, len)
+        })
     }
 
     #[inline]
-    fn poll_write_to<W: ::futures_io::AsyncWrite + ?Sized>(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        write: Pin<&mut W>,
-    ) -> Poll<io::Result<usize>> {
-        let n = ready!(write.poll_write_vectored(cx, &self.read_io_slices()))?;
-        self.read_advance(n);
-        Poll::Ready(Ok(n))
-    }
-
-    #[inline]
-    fn write_to<W: ::futures_io::AsyncWrite + Unpin + ?Sized>(
-        &mut self,
-        mut write: &mut W,
-    ) -> impl Future<Output = io::Result<usize>> {
-        poll_fn(move |cx| FuturesIoBuf::poll_write_to(Pin::new(self), cx, Pin::new(&mut write)))
+    pub fn read_from<E>(
+        &self,
+        mut f: impl FnMut(&mut [&mut [u8]], usize) -> Result<usize, E>,
+    ) -> Result<usize, E> {
+        self.buffer.synced_read(|mut bufs, len| f(&mut bufs, len))
     }
 }
 
-#[cfg(feature = "tokio1")]
-pub trait TokioBuf {
-    // TODO: vectored read?
-
-    /// Attempts to write to the [`AsyncWrite`].
-    ///
-    /// Returns [`Poll::Pending`] if nothing can be written at the moment.
-    /// Returns [`Poll::Ready`] with [`Ok`] and the
-    /// number of bytes written on success.
-    /// (The internal write position is advanced implicitly on successful write.)
-    ///
-    /// # Errors
-    ///
-    /// On error, [`Err`] returns the I/O error from the [`AsyncWrite`].
-    fn poll_write_to<W: ::tokio::io::AsyncWrite + Send + ?Sized>(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        write: Pin<&mut W>,
-    ) -> Poll<io::Result<usize>>;
-
-    /// Writes to the [`AsyncWrite`].
-    ///
-    /// Returns [`Ok`] and the number of bytes written on success.
-    /// (The internal write position is advanced implicitly.)
-    ///
-    /// # Errors
-    ///
-    /// On error, [`Err`] returns the I/O error from the [`AsyncWrite`].
-    fn write_to<W: ::tokio::io::AsyncWrite + Send + ?Sized + Unpin>(
-        &mut self,
-        write: &mut W,
-    ) -> impl Future<Output = io::Result<usize>> + Send;
+#[derive(Debug)]
+pub struct Writer {
+    buffer: Arc<BufferInner>,
+    _notsync: PhantomData<*mut ()>,
 }
 
-#[cfg(feature = "tokio1")]
-impl TokioBuf for Buffer {
+unsafe impl Send for Writer {}
+
+impl Writer {
+    #[cfg(feature = "std")]
     #[inline]
-    fn poll_write_to<W: ::tokio::io::AsyncWrite + Send + ?Sized>(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        write: Pin<&mut W>,
-    ) -> Poll<io::Result<usize>> {
-        let n = ready!(write.poll_write_vectored(cx, &self.read_io_slices()))?;
-        self.read_advance(n);
-        Poll::Ready(Ok(n))
+    pub fn io_write_into(
+        &self,
+        mut f: impl FnMut(&[io::IoSlice<'_>], usize) -> io::Result<usize>,
+    ) -> io::Result<usize> {
+        self.buffer.synced_write(|bufs, len| {
+            let bufs = bufs.map(io::IoSlice::new);
+            f(&bufs, len)
+        })
     }
 
     #[inline]
-    fn write_to<W: ::tokio::io::AsyncWrite + Send + ?Sized + Unpin>(
-        &mut self,
-        write: &mut W,
-    ) -> impl Future<Output = io::Result<usize>> + Send {
-        poll_fn(move |cx| TokioBuf::poll_write_to(Pin::new(self), cx, Pin::new(write)))
+    pub fn write_into<E>(
+        &self,
+        mut f: impl FnMut(&[&[u8]], usize) -> Result<usize, E>,
+    ) -> Result<usize, E> {
+        self.buffer.synced_write(|bufs, len| f(&bufs, len))
+    }
+}
+
+#[derive(Debug)]
+struct AlignedData {
+    ptr: NonNull<u8>,
+    layout: Layout,
+}
+
+unsafe impl Send for AlignedData {}
+
+impl AlignedData {
+    #[inline]
+    fn new(size: usize, align: usize) -> Self {
+        let layout = Layout::from_size_align(size, align).unwrap();
+        let ptr = unsafe { alloc(layout) };
+        let ptr = NonNull::new(ptr).unwrap();
+
+        let addr = ptr.as_ptr() as usize;
+        assert_eq!(addr % align, 0, "aligned alloc failed");
+
+        AlignedData { ptr, layout }
+    }
+
+    #[must_use]
+    #[inline]
+    fn slice(&self) -> &[u8] {
+        unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.layout.size()) }
+    }
+
+    #[must_use]
+    #[inline]
+    fn slice_mut(&mut self) -> &mut [u8] {
+        unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.layout.size()) }
+    }
+}
+
+impl Drop for AlignedData {
+    #[inline]
+    fn drop(&mut self) {
+        unsafe {
+            dealloc(self.ptr.as_ptr(), self.layout);
+        }
+    }
+}
+
+impl AsRef<[u8]> for AlignedData {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.slice()
+    }
+}
+
+impl AsMut<[u8]> for AlignedData {
+    #[inline]
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.slice_mut()
+    }
+}
+
+impl Deref for AlignedData {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.slice()
+    }
+}
+
+impl DerefMut for AlignedData {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.slice_mut()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use ::core::marker::{Send, Sized, Sync};
+    use ::static_assertions::{assert_impl_all, assert_not_impl_any};
+
     use super::*;
-    use ::core::assert_eq;
 
-    #[test]
-    fn test_advance() {
-        let mut buf = Buffer::new(16);
-        // 0123456789012345
-        // ----------------
-        assert_eq!(0, buf.len());
-
-        let [a, b] = buf.write_io_slices();
-        assert_eq!(16, a.len());
-        assert_eq!(0, b.len());
-        let [a, b] = buf.read_io_slices();
-        assert_eq!(0, a.len());
-        assert_eq!(0, b.len());
-
-        buf.write_advance(3);
-        // 0123456789012345
-        // ***-------------
-        assert_eq!(3, buf.len());
-
-        let [a, b] = buf.write_io_slices();
-        assert_eq!(13, a.len());
-        assert_eq!(0, b.len());
-        let [a, b] = buf.read_io_slices();
-        assert_eq!(3, a.len());
-        assert_eq!(0, b.len());
-
-        buf.write_advance(7);
-        // 0123456789012345
-        // **********------
-        assert_eq!(10, buf.len());
-
-        let [a, b] = buf.write_io_slices();
-        assert_eq!(6, a.len());
-        assert_eq!(0, b.len());
-        let [a, b] = buf.read_io_slices();
-        assert_eq!(10, a.len());
-        assert_eq!(0, b.len());
-
-        buf.read_advance(8);
-        // 0123456789012345
-        // --------**------
-        assert_eq!(2, buf.len());
-
-        let [a, b] = buf.write_io_slices();
-        assert_eq!(6, a.len());
-        assert_eq!(8, b.len());
-        let [a, b] = buf.read_io_slices();
-        assert_eq!(2, a.len());
-        assert_eq!(0, b.len());
-
-        buf.write_advance(9);
-        // 0123456789012345
-        // ***-----********
-        assert_eq!(11, buf.len());
-
-        let [a, b] = buf.write_io_slices();
-        assert_eq!(5, a.len());
-        assert_eq!(0, b.len());
-        let [a, b] = buf.read_io_slices();
-        assert_eq!(8, a.len());
-        assert_eq!(3, b.len());
-
-        buf.read_advance(10);
-        // 0123456789012345
-        // --*-------------
-        assert_eq!(1, buf.len());
-
-        let [a, b] = buf.write_io_slices();
-        assert_eq!(13, a.len());
-        assert_eq!(2, b.len());
-        let [a, b] = buf.read_io_slices();
-        assert_eq!(1, a.len());
-        assert_eq!(0, b.len());
-
-        buf.read_advance(1);
-        // 0123456789012345
-        // ----------------
-        assert_eq!(0, buf.len());
-
-        let [a, b] = buf.write_io_slices();
-        assert_eq!(16, a.len());
-        assert_eq!(0, b.len());
-        let [a, b] = buf.read_io_slices();
-        assert_eq!(0, a.len());
-        assert_eq!(0, b.len());
-    }
+    assert_impl_all!(BufferInner: Send, Sync);
+    assert_impl_all!(Reader: Send);
+    assert_not_impl_any!(Reader: Sync);
+    assert_impl_all!(Writer: Send);
+    assert_not_impl_any!(Writer: Sync);
 }

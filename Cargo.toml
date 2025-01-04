@@ -1,6 +1,6 @@
 [package]
 name = "bytering"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A ring buffer specialized for vectored reading and writing in blocking and async I/O"
 authors = ["Folke <folke@gmail.com>"]
@@ -11,11 +11,10 @@ repository = "https://github.com/cloneable/bytering"
 exclude = [".gitignore", "examples"]
 
 [features]
-default = ["std", "tokio1", "futures0"]
-std = ["futures-io?/std"]
-futures0 = ["dep:futures-io", "std"]
-tokio1 = ["dep:tokio", "std"]
+default = ["std"]
+std = []
 
 [dependencies]
-futures-io = { version = "0.3", default-features = false, features = [], optional = true }
-tokio = { version = "1", default-features = false, features = [], optional = true }
+
+[dev-dependencies]
+static_assertions = "1"
