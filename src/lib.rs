@@ -1,4 +1,5 @@
 #![deny(
+    clippy::undocumented_unsafe_blocks,
     deprecated,
     rust_2024_compatibility,
     clippy::all,
@@ -12,11 +13,7 @@
     clippy::missing_const_for_fn,
 )]
 // TODO: document everything
-#![expect(
-    clippy::undocumented_unsafe_blocks,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc
-)]
+#![expect(clippy::missing_panics_doc, clippy::missing_errors_doc)]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![no_implicit_prelude]
 
@@ -90,20 +87,31 @@ struct BufferInner {
     data: UnsafeCell<AlignedData>,
 }
 
-// TODO: make data sync, if possible
+// SAFETY: Sync is safe because slices of data are guaranteed to not be aliased.
+// TODO: make data sync, if possible. And switch to `SyncUnsafeCell`.
 unsafe impl Sync for BufferInner {}
 
 impl BufferInner {
+    // SAFETY: callers of `data` and `data_mut` must make sure that the
+    //         returned slice is split into non-overlapping subslices.
+    // TODO: consider moving the segmentation here to make these accessors safe.
     #[must_use]
     #[inline]
-    fn data(&self) -> &[u8] {
+    unsafe fn data(&self) -> &[u8] {
+        // SAFETY: the UnsafeCell contains a properly initialized instance of
+        //         AlignedData and the mut pointer can be cast to a non-mut ref.
         unsafe { &*(self.data.get()) }
     }
 
-    #[allow(clippy::mut_from_ref)]
+    // SAFETY: callers of `data` and `data_mut` must make sure that the
+    //         returned slice is split into non-overlapping subslices.
+    // TODO: consider moving the segmentation here to make these accessors safe.
+    #[expect(clippy::mut_from_ref)]
     #[must_use]
     #[inline]
     unsafe fn data_mut(&self) -> &mut [u8] {
+        // SAFETY: the UnsafeCell contains a properly initialized instance of
+        //         AlignedData and the mut pointer can be cast to a mut ref.
         unsafe { &mut *self.data.get() }
     }
 
@@ -115,7 +123,12 @@ impl BufferInner {
         let r = self.read.load(Relaxed);
         let w = self.write.load(Acquire);
 
+        // SAFETY: there can only be one reader and it further constrains the
+        //         slice to the space between the raad and the write position.
+        // TODO: consider moving the deref into reader to couple with safety
+        //       guarantee.
         let data = unsafe { self.data_mut() };
+
         let (bufs, len) = empty_segments_for_write(data, self.mask, r, w);
         let n = f(bufs, len)?;
         debug_assert!(n <= len, "{n} <= {len}");
@@ -132,7 +145,13 @@ impl BufferInner {
         let r = self.read.load(Relaxed);
         let w = self.write.load(Acquire);
 
-        let (bufs, len) = filled_segments_for_read(self.data(), self.mask, r, w);
+        // SAFETY: there can only be one writer and it further constrains the
+        //         slice to the space between the write and the read position.
+        // TODO: consider moving the deref into writer to couple with safety
+        //       guarantee.
+        let data = unsafe { self.data() };
+
+        let (bufs, len) = filled_segments_for_read(data, self.mask, r, w);
         let n = f(bufs, len)?;
         debug_assert!(n <= len, "{n} <= {len}");
 
@@ -201,6 +220,9 @@ pub struct Reader {
     _notsync: PhantomData<*mut ()>,
 }
 
+// SAFETY: Reader is already Send, but to prevent Sync it contains a PhantomData
+//         field preventing both traits. Until negative trait bounds are allowed
+//         this Send impl is needed.
 unsafe impl Send for Reader {}
 
 impl Reader {
@@ -231,6 +253,9 @@ pub struct Writer {
     _notsync: PhantomData<*mut ()>,
 }
 
+// SAFETY: Writer is already Send, but to prevent Sync it contains a PhantomData
+//         field preventing both traits. Until negative trait bounds are allowed
+//         this Send impl is needed.
 unsafe impl Send for Writer {}
 
 impl Writer {
@@ -261,6 +286,9 @@ struct AlignedData {
     layout: Layout,
 }
 
+// SAFETY: Send is safe because pointer cannot be accessed directly.
+//         Aliasing rules are followed by requiring a mut ref xor non-mut refs
+//         to access the pointed to data.
 unsafe impl Send for AlignedData {}
 
 impl AlignedData {
@@ -269,8 +297,10 @@ impl AlignedData {
         assert_ne!(size, 0, "size cannot be zero");
 
         let layout = Layout::from_size_align(size, align).unwrap();
-        let ptr = unsafe { alloc(layout) };
-        let ptr = NonNull::new(ptr).unwrap();
+
+        // SAFETY: alloc is called with a correct layout with a non-zero size.
+        // A null pointer is immediately handled.
+        let ptr = unsafe { NonNull::new(alloc(layout)).unwrap() };
 
         let addr = ptr.as_ptr() as usize;
         assert_eq!(addr % align, 0, "aligned alloc failed");
@@ -281,12 +311,18 @@ impl AlignedData {
     #[must_use]
     #[inline]
     fn slice(&self) -> &[u8] {
+        // SAFETY: from_raw_parts is called with the non-null pointer returned
+        //         by alloc with the original size used by the layout.
+        //         No alignment requirements due to u8.
         unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.layout.size()) }
     }
 
     #[must_use]
     #[inline]
     fn slice_mut(&mut self) -> &mut [u8] {
+        // SAFETY: from_raw_parts_mut is called with the non-null pointer
+        //         returned by alloc with the original size used by the layout.
+        //         No alignment requirements due to u8.
         unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.layout.size()) }
     }
 }
@@ -294,6 +330,8 @@ impl AlignedData {
 impl Drop for AlignedData {
     #[inline]
     fn drop(&mut self) {
+        // SAFETY: dealloc is called with the non-null pointer returned by
+        //         alloc and the same layout.
         unsafe {
             dealloc(self.ptr.as_ptr(), self.layout);
         }
