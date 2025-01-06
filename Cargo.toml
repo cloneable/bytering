@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 categories = ["data-structures"]
 keywords = []
 repository = "https://github.com/cloneable/bytering"
-exclude = [".gitignore", "examples"]
+exclude = [".gitignore", ".github", "examples"]
 
 [features]
 default = ["std"]
