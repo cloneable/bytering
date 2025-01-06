@@ -33,7 +33,7 @@ use ::core::ptr::NonNull;
 use ::core::result::Result::{self, Ok};
 use ::core::sync::atomic::AtomicUsize;
 use ::core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use ::core::{assert, assert_eq, debug_assert, debug_assert_eq, slice};
+use ::core::{assert, assert_eq, assert_ne, debug_assert, debug_assert_eq, slice};
 #[cfg(feature = "std")]
 use ::std::io;
 
@@ -45,21 +45,23 @@ pub struct Buffer {
 impl Buffer {
     #[must_use]
     #[inline]
-    pub fn new(capacity: usize, alignment: usize) -> Self {
+    pub fn new(size: usize, align: usize) -> Self {
         assert!(
-            capacity.is_power_of_two(),
-            "capacity is not power of two: {capacity}"
+            size.is_power_of_two(), // implies != 0
+            "size is not power of two: {size}"
         );
-        assert!(
-            alignment.is_power_of_two(),
-            "alignment is not power of two: {alignment}"
-        );
+        // TODO: consider accepting any modulus and let compiler optimize
+        //       this into and-ing for power-of-2s.
+        let mask = size - 1;
+
+        let data = UnsafeCell::new(AlignedData::new(size, align));
+
         Buffer {
             inner: Arc::new(BufferInner {
                 read: AtomicUsize::new(0),
                 write: AtomicUsize::new(0),
-                mask: capacity - 1,
-                data: UnsafeCell::new(AlignedData::new(capacity, alignment)),
+                mask,
+                data,
             }),
         }
     }
@@ -264,6 +266,8 @@ unsafe impl Send for AlignedData {}
 impl AlignedData {
     #[inline]
     fn new(size: usize, align: usize) -> Self {
+        assert_ne!(size, 0, "size cannot be zero");
+
         let layout = Layout::from_size_align(size, align).unwrap();
         let ptr = unsafe { alloc(layout) };
         let ptr = NonNull::new(ptr).unwrap();
