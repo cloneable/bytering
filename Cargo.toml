@@ -17,4 +17,15 @@ std = []
 [dependencies]
 
 [dev-dependencies]
+rand = { version = "0.8", features = ["small_rng"] }
 static_assertions = "1"
+
+[profile.release]
+lto = true
+opt-level = 3
+debug-assertions = true
+overflow-checks = true
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = true

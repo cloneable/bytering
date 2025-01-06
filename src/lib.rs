@@ -264,6 +264,12 @@ impl Reader {
     ) -> Result<usize, E> {
         self.buffer.synced_read(|mut bufs, len| f(&mut bufs, len))
     }
+
+    #[doc(hidden)]
+    #[inline]
+    pub fn position(&self) -> usize {
+        self.buffer.write.load(Relaxed)
+    }
 }
 
 #[derive(Debug)]
@@ -310,6 +316,20 @@ impl Writer {
         mut f: impl FnMut(&[&[u8]], usize) -> Result<usize, E>,
     ) -> Result<usize, E> {
         self.buffer.synced_write(|bufs, len| f(&bufs, len))
+    }
+
+    #[doc(hidden)]
+    #[inline]
+    pub fn position(&self) -> usize {
+        self.buffer.read.load(Relaxed)
+    }
+
+    #[doc(hidden)]
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        let r = self.buffer.read.load(Relaxed);
+        let w = self.buffer.write.load(Relaxed);
+        w == r
     }
 }
 
