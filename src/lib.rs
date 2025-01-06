@@ -12,8 +12,6 @@
     // API may still change.
     clippy::missing_const_for_fn,
 )]
-// TODO: document everything
-#![expect(clippy::missing_panics_doc, clippy::missing_errors_doc)]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![no_implicit_prelude]
 
@@ -40,6 +38,11 @@ pub struct Buffer {
 }
 
 impl Buffer {
+    /// Creates a new instance of specified `size` (capacity) and alignment.
+    ///
+    /// # Panics
+    ///
+    /// Will panic if `size` or `align` is not a power of 2.
     #[must_use]
     #[inline]
     pub fn new(size: usize, align: usize) -> Self {
@@ -63,6 +66,8 @@ impl Buffer {
         }
     }
 
+    /// Consumes the buffer and splits it into a `Reader` and a `Writer` half
+    /// that can be send to other threads.
     #[must_use]
     #[inline]
     pub fn into_parts(self) -> (Reader, Writer) {
@@ -226,6 +231,14 @@ pub struct Reader {
 unsafe impl Send for Reader {}
 
 impl Reader {
+    /// Calls the passed closure with a pair of [`io::IoSliceMut`] meant to be
+    /// used with [`io::Read::read_vectored`] and async variants and the total
+    /// length of both slices.
+    /// The closure must return the number of bytes read on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error from the closure unchanged.
     #[cfg(feature = "std")]
     #[inline]
     pub fn io_slices(
@@ -238,6 +251,12 @@ impl Reader {
         })
     }
 
+    /// Calls the passed closure with a pair of `&mut [u8]` meant to be
+    /// used with non `std::io` vectored read operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error from the closure unchanged.
     #[inline]
     pub fn slices<E>(
         &self,
@@ -259,6 +278,14 @@ pub struct Writer {
 unsafe impl Send for Writer {}
 
 impl Writer {
+    /// Calls the passed closure with a pair of [`io::IoSlice`] meant to be
+    /// used with [`io::Read::write_vectored`] and async variants and the total
+    /// length of both slices.
+    /// The closure must return the number of bytes written on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error from the closure unchanged.
     #[cfg(feature = "std")]
     #[inline]
     pub fn io_slices(
@@ -271,6 +298,12 @@ impl Writer {
         })
     }
 
+    /// Calls the passed closure with a pair of `&[u8]` meant to be
+    /// used with non `std::io` vectored write operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error from the closure unchanged.
     #[inline]
     pub fn slices<E>(
         &self,
