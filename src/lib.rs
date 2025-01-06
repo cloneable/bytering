@@ -33,7 +33,7 @@ use ::core::ptr::NonNull;
 use ::core::result::Result::{self, Ok};
 use ::core::sync::atomic::AtomicUsize;
 use ::core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use ::core::{assert, assert_eq, slice};
+use ::core::{assert, assert_eq, debug_assert, debug_assert_eq, slice};
 #[cfg(feature = "std")]
 use ::std::io;
 
@@ -109,26 +109,13 @@ impl BufferInner {
         let r = self.read.load(Relaxed);
         let w = self.write.load(Acquire);
 
-        let (bufs, len) = self.empty_segments(r, w);
-        let n = f(bufs, len)?;
-        assert!(n <= len);
-
-        self.write.store(w + n, Release);
-        Ok(n)
-    }
-
-    #[must_use]
-    #[inline]
-    fn empty_segments(&self, read: usize, write: usize) -> ([&mut [u8]; 2], usize) {
-        let (start, end) = (read & self.mask, write & self.mask);
         let data = unsafe { self.data_mut() };
-        let len = data.len() - (write - read);
-        if start > end {
-            ([&mut data[end..start], &mut []], len)
-        } else {
-            let (b, a) = data.split_at_mut(end);
-            ([a, &mut b[..start]], len)
-        }
+        let (bufs, len) = empty_segments_for_write(data, self.mask, r, w);
+        let n = f(bufs, len)?;
+        debug_assert!(n <= len, "{n} <= {len}");
+
+        self.write.store(w.checked_add(n).unwrap(), Release);
+        Ok(n)
     }
 
     #[inline]
@@ -139,27 +126,67 @@ impl BufferInner {
         let r = self.read.load(Relaxed);
         let w = self.write.load(Acquire);
 
-        let (bufs, len) = self.filled_segments(r, w);
+        let (bufs, len) = filled_segments_for_read(self.data(), self.mask, r, w);
         let n = f(bufs, len)?;
-        assert!(n <= len);
+        debug_assert!(n <= len, "{n} <= {len}");
 
-        self.read.store(r + n, Release);
+        self.read.store(r.checked_add(n).unwrap(), Release);
         Ok(n)
     }
+}
 
-    #[must_use]
-    #[inline]
-    fn filled_segments(&self, read: usize, write: usize) -> ([&[u8]; 2], usize) {
-        let (start, end) = (read & self.mask, write & self.mask);
-        let data = self.data();
-        let len = write - read;
-        if start < end {
-            ([&data[start..end], &[]], len)
-        } else {
-            let (b, a) = data.split_at(start);
-            ([a, &b[..end]], len)
-        }
-    }
+#[must_use]
+#[inline]
+fn filled_segments_for_read(
+    data: &[u8],
+    mask: usize,
+    read: usize,
+    write: usize,
+) -> ([&[u8]; 2], usize) {
+    debug_assert!(read <= write);
+    debug_assert!(write <= read + data.len());
+
+    let len = write - read;
+    let start = read & mask;
+    let end = start + len;
+    let endw = end & mask;
+
+    let bufs = if end == endw {
+        [&data[start..end], &[]]
+    } else {
+        let (b, a) = data.split_at(start);
+        [a, &b[..endw]]
+    };
+
+    debug_assert_eq!(bufs[0].len() + bufs[1].len(), len);
+    (bufs, len)
+}
+
+#[must_use]
+#[inline]
+fn empty_segments_for_write(
+    data: &mut [u8],
+    mask: usize,
+    read: usize,
+    write: usize,
+) -> ([&mut [u8]; 2], usize) {
+    debug_assert!(read <= write);
+    debug_assert!(write <= read + data.len());
+
+    let len = data.len() - (write - read);
+    let start = write & mask;
+    let end = start + len;
+    let endw = end & mask;
+
+    let bufs = if end == endw {
+        [&mut data[start..end], &mut []]
+    } else {
+        let (b, a) = data.split_at_mut(start);
+        [a, &mut b[..endw]]
+    };
+
+    debug_assert_eq!(bufs[0].len() + bufs[1].len(), len);
+    (bufs, len)
 }
 
 #[derive(Debug)]
@@ -173,7 +200,7 @@ unsafe impl Send for Reader {}
 impl Reader {
     #[cfg(feature = "std")]
     #[inline]
-    pub fn io_read_from(
+    pub fn io_slices(
         &self,
         mut f: impl FnMut(&mut [io::IoSliceMut<'_>], usize) -> io::Result<usize>,
     ) -> io::Result<usize> {
@@ -184,7 +211,7 @@ impl Reader {
     }
 
     #[inline]
-    pub fn read_from<E>(
+    pub fn slices<E>(
         &self,
         mut f: impl FnMut(&mut [&mut [u8]], usize) -> Result<usize, E>,
     ) -> Result<usize, E> {
@@ -203,7 +230,7 @@ unsafe impl Send for Writer {}
 impl Writer {
     #[cfg(feature = "std")]
     #[inline]
-    pub fn io_write_into(
+    pub fn io_slices(
         &self,
         mut f: impl FnMut(&[io::IoSlice<'_>], usize) -> io::Result<usize>,
     ) -> io::Result<usize> {
@@ -214,7 +241,7 @@ impl Writer {
     }
 
     #[inline]
-    pub fn write_into<E>(
+    pub fn slices<E>(
         &self,
         mut f: impl FnMut(&[&[u8]], usize) -> Result<usize, E>,
     ) -> Result<usize, E> {
@@ -307,4 +334,95 @@ mod tests {
     assert_not_impl_any!(Reader: Sync);
     assert_impl_all!(Writer: Send);
     assert_not_impl_any!(Writer: Sync);
+
+    #[test]
+    fn test_filled_segments_for_read() {
+        let data = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let mask = 15;
+
+        let (bufs, len) = filled_segments_for_read(&data, mask, 2, 13);
+        assert_eq!(bufs[0], &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        assert_eq!(bufs[1].len(), 0);
+        assert_eq!(len, 11);
+
+        let (bufs, len) = filled_segments_for_read(&data, mask, 17, 20);
+        assert_eq!(bufs[0], &[1, 2, 3]);
+        assert_eq!(bufs[1].len(), 0);
+        assert_eq!(len, 3);
+
+        let (bufs, len) = filled_segments_for_read(&data, mask, 10, 20);
+        assert_eq!(bufs[0], &[10, 11, 12, 13, 14, 15]);
+        assert_eq!(bufs[1], &[0, 1, 2, 3]);
+        assert_eq!(len, 10);
+
+        let (bufs, len) = filled_segments_for_read(&data, mask, 16, 20);
+        assert_eq!(bufs[0], &[0, 1, 2, 3]);
+        assert_eq!(bufs[1].len(), 0);
+        assert_eq!(len, 4);
+
+        let (bufs, len) = filled_segments_for_read(&data, mask, 0, 16);
+        assert_eq!(
+            bufs[0],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
+        assert_eq!(bufs[1].len(), 0);
+        assert_eq!(len, 16);
+
+        let (bufs, len) = filled_segments_for_read(&data, mask, 0, 0);
+        assert_eq!(bufs[0].len(), 0);
+        assert_eq!(bufs[1].len(), 0);
+        assert_eq!(len, 0);
+
+        let (bufs, len) = filled_segments_for_read(&data, mask, 15, 15);
+        assert_eq!(bufs[0].len(), 0);
+        assert_eq!(bufs[1].len(), 0);
+        assert_eq!(len, 0);
+
+        let (bufs, len) = filled_segments_for_read(&data, mask, 16, 16);
+        assert_eq!(bufs[0].len(), 0);
+        assert_eq!(bufs[1].len(), 0);
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn test_empty_segments_for_write() {
+        let mut data = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let mask = 15;
+
+        let (bufs, len) = empty_segments_for_write(&mut data, mask, 2, 13);
+        assert_eq!(bufs[0], &[13, 14, 15]);
+        assert_eq!(bufs[1], &[0, 1]);
+        assert_eq!(len, 5);
+
+        let (bufs, len) = empty_segments_for_write(&mut data, mask, 13, 17);
+        assert_eq!(bufs[0], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        assert_eq!(bufs[1], &[]);
+        assert_eq!(len, 12);
+
+        let (bufs, len) = empty_segments_for_write(&mut data, mask, 0, 16);
+        assert_eq!(bufs[0].len(), 0);
+        assert_eq!(bufs[1].len(), 0);
+        assert_eq!(len, 0);
+
+        let (bufs, len) = empty_segments_for_write(&mut data, mask, 0, 0);
+        assert_eq!(
+            bufs[0],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
+        assert_eq!(bufs[1].len(), 0);
+        assert_eq!(len, 16);
+
+        let (bufs, len) = empty_segments_for_write(&mut data, mask, 15, 15);
+        assert_eq!(bufs[0], &[15]);
+        assert_eq!(bufs[1], &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+        assert_eq!(len, 16);
+
+        let (bufs, len) = empty_segments_for_write(&mut data, mask, 16, 16);
+        assert_eq!(
+            bufs[0],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
+        assert_eq!(bufs[1].len(), 0);
+        assert_eq!(len, 16);
+    }
 }
