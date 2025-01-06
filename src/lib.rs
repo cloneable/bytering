@@ -17,7 +17,7 @@
 
 extern crate alloc;
 
-use ::alloc::alloc::{alloc, dealloc, Layout};
+use ::alloc::alloc::{alloc_zeroed, dealloc, Layout};
 use ::alloc::sync::Arc;
 use ::core::cell::UnsafeCell;
 use ::core::clone::Clone;
@@ -266,6 +266,7 @@ impl Reader {
     }
 
     #[doc(hidden)]
+    #[must_use]
     #[inline]
     pub fn position(&self) -> usize {
         self.buffer.write.load(Relaxed)
@@ -319,12 +320,14 @@ impl Writer {
     }
 
     #[doc(hidden)]
+    #[must_use]
     #[inline]
     pub fn position(&self) -> usize {
         self.buffer.read.load(Relaxed)
     }
 
     #[doc(hidden)]
+    #[must_use]
     #[inline]
     pub fn is_empty(&self) -> bool {
         let r = self.buffer.read.load(Relaxed);
@@ -352,8 +355,8 @@ impl AlignedData {
         let layout = Layout::from_size_align(size, align).unwrap();
 
         // SAFETY: alloc is called with a correct layout with a non-zero size.
-        // A null pointer is immediately handled.
-        let ptr = unsafe { NonNull::new(alloc(layout)).unwrap() };
+        //         A null pointer is immediately handled.
+        let ptr = unsafe { NonNull::new(alloc_zeroed(layout)).unwrap() };
 
         let addr = ptr.as_ptr() as usize;
         assert_eq!(addr % align, 0, "aligned alloc failed");
