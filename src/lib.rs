@@ -45,17 +45,21 @@ pub struct Buffer {
 impl Buffer {
     #[must_use]
     #[inline]
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize, alignment: usize) -> Self {
         assert!(
             capacity.is_power_of_two(),
             "capacity is not power of two: {capacity}"
+        );
+        assert!(
+            alignment.is_power_of_two(),
+            "alignment is not power of two: {alignment}"
         );
         Buffer {
             inner: Arc::new(BufferInner {
                 read: AtomicUsize::new(0),
                 write: AtomicUsize::new(0),
                 mask: capacity - 1,
-                data: UnsafeCell::new(AlignedData::new(capacity, 4096)),
+                data: UnsafeCell::new(AlignedData::new(capacity, alignment)),
             }),
         }
     }
