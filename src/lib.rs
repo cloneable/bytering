@@ -19,16 +19,14 @@ extern crate alloc;
 
 use ::alloc::alloc::{alloc_zeroed, dealloc, Layout};
 use ::alloc::sync::Arc;
-use ::core::cell::UnsafeCell;
 use ::core::clone::Clone;
-use ::core::convert::{AsMut, AsRef};
 use ::core::marker::{PhantomData, Send, Sync};
-use ::core::ops::{Deref, DerefMut, Drop, FnMut};
-use ::core::ptr::NonNull;
+use ::core::ops::{Drop, FnMut, Range};
+use ::core::ptr::{self, NonNull};
 use ::core::result::Result::{self, Ok};
 use ::core::sync::atomic::AtomicUsize;
 use ::core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use ::core::{assert, assert_eq, assert_ne, debug_assert, debug_assert_eq, slice};
+use ::core::{assert, assert_eq, assert_ne, debug_assert};
 #[cfg(feature = "std")]
 use ::std::io;
 
@@ -54,7 +52,7 @@ impl Buffer {
         //       this into and-ing for power-of-2s.
         let mask = size - 1;
 
-        let data = UnsafeCell::new(AlignedData::new(size, align));
+        let data = AlignedData::new(size, align);
 
         Buffer {
             inner: Arc::new(BufferInner {
@@ -89,7 +87,7 @@ struct BufferInner {
     read: AtomicUsize,
     write: AtomicUsize,
     mask: usize,
-    data: UnsafeCell<AlignedData>,
+    data: AlignedData,
 }
 
 // SAFETY: Sync is safe because slices of data are guaranteed to not be aliased.
@@ -97,44 +95,18 @@ struct BufferInner {
 unsafe impl Sync for BufferInner {}
 
 impl BufferInner {
-    // SAFETY: callers of `data` and `data_mut` must make sure that the
-    //         returned slice is split into non-overlapping subslices.
-    // TODO: consider moving the segmentation here to make these accessors safe.
-    #[must_use]
-    #[inline]
-    unsafe fn data(&self) -> &[u8] {
-        // SAFETY: the UnsafeCell contains a properly initialized instance of
-        //         AlignedData and the mut pointer can be cast to a non-mut ref.
-        unsafe { &*(self.data.get()) }
-    }
-
-    // SAFETY: callers of `data` and `data_mut` must make sure that the
-    //         returned slice is split into non-overlapping subslices.
-    // TODO: consider moving the segmentation here to make these accessors safe.
-    #[expect(clippy::mut_from_ref)]
-    #[must_use]
-    #[inline]
-    unsafe fn data_mut(&self) -> &mut [u8] {
-        // SAFETY: the UnsafeCell contains a properly initialized instance of
-        //         AlignedData and the mut pointer can be cast to a mut ref.
-        unsafe { &mut *self.data.get() }
-    }
-
     #[inline]
     fn synced_read<E>(
         &self,
         mut f: impl FnMut([&mut [u8]; 2], usize) -> Result<usize, E>,
     ) -> Result<usize, E> {
-        let r = self.read.load(Relaxed);
-        let w = self.write.load(Acquire);
+        let w = self.write.load(Relaxed);
+        let r = self.read.load(Acquire);
 
-        // SAFETY: there can only be one reader and it further constrains the
-        //         slice to the space between the raad and the write position.
-        // TODO: consider moving the deref into reader to couple with safety
-        //       guarantee.
-        let data = unsafe { self.data_mut() };
-
-        let (bufs, len) = empty_segments_for_write(data, self.mask, r, w);
+        let (ranges, len) = empty_ranges(self.data.len(), self.mask, r, w);
+        // SAFETY: ranges are guaranteed to not overlap with any ranges
+        //         `synced_write` will use at the same time.
+        let bufs = unsafe { self.data.slices_mut(ranges) };
         let n = f(bufs, len)?;
         debug_assert!(n <= len, "{n} <= {len}");
 
@@ -150,13 +122,10 @@ impl BufferInner {
         let r = self.read.load(Relaxed);
         let w = self.write.load(Acquire);
 
-        // SAFETY: there can only be one writer and it further constrains the
-        //         slice to the space between the write and the read position.
-        // TODO: consider moving the deref into writer to couple with safety
-        //       guarantee.
-        let data = unsafe { self.data() };
-
-        let (bufs, len) = filled_segments_for_read(data, self.mask, r, w);
+        let (ranges, len) = filled_ranges(self.data.len(), self.mask, r, w);
+        // SAFETY: ranges are guaranteed to not overlap with any ranges
+        //         `synced_read` will use at the same time.
+        let bufs = unsafe { self.data.slices(ranges) };
         let n = f(bufs, len)?;
         debug_assert!(n <= len, "{n} <= {len}");
 
@@ -167,56 +136,54 @@ impl BufferInner {
 
 #[must_use]
 #[inline]
-fn filled_segments_for_read(
-    data: &[u8],
+const fn filled_ranges(
+    buflen: usize,
     mask: usize,
     read: usize,
     write: usize,
-) -> ([&[u8]; 2], usize) {
+) -> ([Range<usize>; 2], usize) {
     debug_assert!(read <= write);
-    debug_assert!(write <= read + data.len());
+    debug_assert!(write <= read + buflen);
 
     let len = write - read;
     let start = read & mask;
     let end = start + len;
     let endw = end & mask;
 
-    let bufs = if end == endw {
-        [&data[start..end], &[]]
+    let ranges = if end == endw {
+        [start..end, 0..0]
     } else {
-        let (b, a) = data.split_at(start);
-        [a, &b[..endw]]
+        [start..buflen, 0..endw]
     };
 
-    debug_assert_eq!(bufs[0].len() + bufs[1].len(), len);
-    (bufs, len)
+    debug_assert!(range_len(&ranges[0]) + range_len(&ranges[1]) == len);
+    (ranges, len)
 }
 
 #[must_use]
 #[inline]
-fn empty_segments_for_write(
-    data: &mut [u8],
+const fn empty_ranges(
+    buflen: usize,
     mask: usize,
     read: usize,
     write: usize,
-) -> ([&mut [u8]; 2], usize) {
+) -> ([Range<usize>; 2], usize) {
     debug_assert!(read <= write);
-    debug_assert!(write <= read + data.len());
+    debug_assert!(write <= read + buflen);
 
-    let len = data.len() - (write - read);
+    let len = buflen - (write - read);
     let start = write & mask;
     let end = start + len;
     let endw = end & mask;
 
-    let bufs = if end == endw {
-        [&mut data[start..end], &mut []]
+    let ranges = if end == endw {
+        [start..end, 0..0]
     } else {
-        let (b, a) = data.split_at_mut(start);
-        [a, &mut b[..endw]]
+        [start..buflen, 0..endw]
     };
 
-    debug_assert_eq!(bufs[0].len() + bufs[1].len(), len);
-    (bufs, len)
+    debug_assert!(range_len(&ranges[0]) + range_len(&ranges[1]) == len);
+    (ranges, len)
 }
 
 #[derive(Debug)]
@@ -393,20 +360,48 @@ impl AlignedData {
 
     #[must_use]
     #[inline]
-    fn slice(&self) -> &[u8] {
-        // SAFETY: from_raw_parts is called with the non-null pointer returned
-        //         by alloc with the original size used by the layout.
-        //         No alignment requirements due to u8.
-        unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.layout.size()) }
+    fn len(&self) -> usize {
+        self.layout.size()
     }
 
+    /// # Safety
+    /// * The passed ranges must both define non-overlapping regions of the
+    ///   allocated data.
+    /// * The passed ranges must not overlap with any other ranges passed to
+    ///   `slices` or `slices_mut` at the same time.
     #[must_use]
     #[inline]
-    fn slice_mut(&mut self) -> &mut [u8] {
-        // SAFETY: from_raw_parts_mut is called with the non-null pointer
-        //         returned by alloc with the original size used by the layout.
-        //         No alignment requirements due to u8.
-        unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.layout.size()) }
+    unsafe fn slices(&self, ranges: [Range<usize>; 2]) -> [&[u8]; 2] {
+        // SAFETY: the pointer is acquired through alloc_zeroed and is checked
+        //         to be non-null. Provided the safety rules of the method are
+        //         followed then the added pointer offset and the used length
+        //         map a valid region of the allocated data.
+        unsafe {
+            ranges.map(|s| {
+                debug_assert!(s.end <= self.len());
+                &*ptr::slice_from_raw_parts(self.ptr.as_ptr().add(s.start), range_len(&s))
+            })
+        }
+    }
+
+    /// # Safety
+    /// * The passed ranges must both define non-overlapping regions of the
+    ///   allocated data.
+    /// * The passed ranges must not overlap with any other ranges passed to
+    ///   `slices` or `slices_mut` at the same time.
+    #[must_use]
+    #[inline]
+    unsafe fn slices_mut(&self, ranges: [Range<usize>; 2]) -> [&mut [u8]; 2] {
+        // SAFETY: the pointer is acquired through alloc_zeroed and is checked
+        //         to be non-null. Provided the safety rules of the method are
+        //         followed then the added pointer offset and the used length
+        //         map a valid region of the allocated data.
+        unsafe {
+            ranges.map(|s| {
+                debug_assert!(s.end <= self.len());
+                &mut *ptr::slice_from_raw_parts_mut(self.ptr.as_ptr().add(s.start), range_len(&s))
+            })
+        }
     }
 }
 
@@ -421,34 +416,9 @@ impl Drop for AlignedData {
     }
 }
 
-impl AsRef<[u8]> for AlignedData {
-    #[inline]
-    fn as_ref(&self) -> &[u8] {
-        self.slice()
-    }
-}
-
-impl AsMut<[u8]> for AlignedData {
-    #[inline]
-    fn as_mut(&mut self) -> &mut [u8] {
-        self.slice_mut()
-    }
-}
-
-impl Deref for AlignedData {
-    type Target = [u8];
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        self.slice()
-    }
-}
-
-impl DerefMut for AlignedData {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.slice_mut()
-    }
+const fn range_len(r: &Range<usize>) -> usize {
+    debug_assert!(r.start <= r.end);
+    r.end - r.start
 }
 
 #[cfg(test)]
@@ -465,31 +435,36 @@ mod tests {
     assert_not_impl_any!(Writer: Sync);
 
     #[test]
-    fn test_filled_segments_for_read() {
+    fn test_filled_ranges() {
         let data = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
         let mask = 15;
 
-        let (bufs, len) = filled_segments_for_read(&data, mask, 2, 13);
+        let (ranges, len) = filled_ranges(data.len(), mask, 2, 13);
+        let bufs = ranges.map(|r| &data[r]);
         assert_eq!(bufs[0], &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
         assert_eq!(bufs[1].len(), 0);
         assert_eq!(len, 11);
 
-        let (bufs, len) = filled_segments_for_read(&data, mask, 17, 20);
+        let (ranges, len) = filled_ranges(data.len(), mask, 17, 20);
+        let bufs = ranges.map(|r| &data[r]);
         assert_eq!(bufs[0], &[1, 2, 3]);
         assert_eq!(bufs[1].len(), 0);
         assert_eq!(len, 3);
 
-        let (bufs, len) = filled_segments_for_read(&data, mask, 10, 20);
+        let (ranges, len) = filled_ranges(data.len(), mask, 10, 20);
+        let bufs = ranges.map(|r| &data[r]);
         assert_eq!(bufs[0], &[10, 11, 12, 13, 14, 15]);
         assert_eq!(bufs[1], &[0, 1, 2, 3]);
         assert_eq!(len, 10);
 
-        let (bufs, len) = filled_segments_for_read(&data, mask, 16, 20);
+        let (ranges, len) = filled_ranges(data.len(), mask, 16, 20);
+        let bufs = ranges.map(|r| &data[r]);
         assert_eq!(bufs[0], &[0, 1, 2, 3]);
         assert_eq!(bufs[1].len(), 0);
         assert_eq!(len, 4);
 
-        let (bufs, len) = filled_segments_for_read(&data, mask, 0, 16);
+        let (ranges, len) = filled_ranges(data.len(), mask, 0, 16);
+        let bufs = ranges.map(|r| &data[r]);
         assert_eq!(
             bufs[0],
             &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
@@ -497,43 +472,50 @@ mod tests {
         assert_eq!(bufs[1].len(), 0);
         assert_eq!(len, 16);
 
-        let (bufs, len) = filled_segments_for_read(&data, mask, 0, 0);
+        let (ranges, len) = filled_ranges(data.len(), mask, 0, 0);
+        let bufs = ranges.map(|r| &data[r]);
         assert_eq!(bufs[0].len(), 0);
         assert_eq!(bufs[1].len(), 0);
         assert_eq!(len, 0);
 
-        let (bufs, len) = filled_segments_for_read(&data, mask, 15, 15);
+        let (ranges, len) = filled_ranges(data.len(), mask, 15, 15);
+        let bufs = ranges.map(|r| &data[r]);
         assert_eq!(bufs[0].len(), 0);
         assert_eq!(bufs[1].len(), 0);
         assert_eq!(len, 0);
 
-        let (bufs, len) = filled_segments_for_read(&data, mask, 16, 16);
+        let (ranges, len) = filled_ranges(data.len(), mask, 16, 16);
+        let bufs = ranges.map(|r| &data[r]);
         assert_eq!(bufs[0].len(), 0);
         assert_eq!(bufs[1].len(), 0);
         assert_eq!(len, 0);
     }
 
     #[test]
-    fn test_empty_segments_for_write() {
-        let mut data = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    fn test_empty_ranges() {
+        let data = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
         let mask = 15;
 
-        let (bufs, len) = empty_segments_for_write(&mut data, mask, 2, 13);
+        let (ranges, len) = empty_ranges(data.len(), mask, 2, 13);
+        let bufs = ranges.map(|r| &data[r]);
         assert_eq!(bufs[0], &[13, 14, 15]);
         assert_eq!(bufs[1], &[0, 1]);
         assert_eq!(len, 5);
 
-        let (bufs, len) = empty_segments_for_write(&mut data, mask, 13, 17);
+        let (ranges, len) = empty_ranges(data.len(), mask, 13, 17);
+        let bufs = ranges.map(|r| &data[r]);
         assert_eq!(bufs[0], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
         assert_eq!(bufs[1], &[]);
         assert_eq!(len, 12);
 
-        let (bufs, len) = empty_segments_for_write(&mut data, mask, 0, 16);
+        let (ranges, len) = empty_ranges(data.len(), mask, 0, 16);
+        let bufs = ranges.map(|r| &data[r]);
         assert_eq!(bufs[0].len(), 0);
         assert_eq!(bufs[1].len(), 0);
         assert_eq!(len, 0);
 
-        let (bufs, len) = empty_segments_for_write(&mut data, mask, 0, 0);
+        let (ranges, len) = empty_ranges(data.len(), mask, 0, 0);
+        let bufs = ranges.map(|r| &data[r]);
         assert_eq!(
             bufs[0],
             &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
@@ -541,12 +523,14 @@ mod tests {
         assert_eq!(bufs[1].len(), 0);
         assert_eq!(len, 16);
 
-        let (bufs, len) = empty_segments_for_write(&mut data, mask, 15, 15);
+        let (ranges, len) = empty_ranges(data.len(), mask, 15, 15);
+        let bufs = ranges.map(|r| &data[r]);
         assert_eq!(bufs[0], &[15]);
         assert_eq!(bufs[1], &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
         assert_eq!(len, 16);
 
-        let (bufs, len) = empty_segments_for_write(&mut data, mask, 16, 16);
+        let (ranges, len) = empty_ranges(data.len(), mask, 16, 16);
+        let bufs = ranges.map(|r| &data[r]);
         assert_eq!(
             bufs[0],
             &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
