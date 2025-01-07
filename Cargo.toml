@@ -1,6 +1,6 @@
 [package]
 name = "bytering"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "A ring buffer specialized for vectored reading and writing in blocking and async I/O"
 authors = ["Folke <folke@gmail.com>"]
