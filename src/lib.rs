@@ -273,6 +273,22 @@ impl Reader {
     }
 }
 
+// TODO: impl write_vectored
+#[cfg(feature = "std")]
+impl io::Write for Reader {
+    #[inline]
+    fn write(&mut self, src: &[u8]) -> io::Result<usize> {
+        use io::Read;
+        let mut src = io::Cursor::new(src);
+        self.io_slices(move |dsts, _| src.read_vectored(dsts))
+    }
+
+    #[inline]
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct Writer {
     buffer: Arc<BufferInner>,
@@ -333,6 +349,17 @@ impl Writer {
         let r = self.buffer.read.load(Relaxed);
         let w = self.buffer.write.load(Relaxed);
         w == r
+    }
+}
+
+// TODO: impl write_vectored
+#[cfg(feature = "std")]
+impl io::Read for Writer {
+    #[inline]
+    fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
+        use io::Write;
+        let mut dst = io::Cursor::new(dst);
+        self.io_slices(move |srcs, _| dst.write_vectored(srcs))
     }
 }
 
