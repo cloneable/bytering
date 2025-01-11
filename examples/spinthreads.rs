@@ -2,13 +2,13 @@ use std::io::{self, Read, Write};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
-use std::thread;
+use std::{hint, thread};
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
 fn main() -> io::Result<()> {
-    const DATA_SIZE: usize = 1_000_000_000;
+    const DATA_SIZE: usize = 10_000_000_000;
 
     let (reader, writer) = bytering::Buffer::new(4096, 4096).into_parts();
 
@@ -26,15 +26,22 @@ fn main() -> io::Result<()> {
     let reader_thread: thread::JoinHandle<io::Result<_>> = thread::Builder::new()
         .name("reader".into())
         .spawn(move || loop {
+            let mut stop = false;
             reader.io_slices(|bufs, len| {
-                let n = input.read_vectored(bufs)?;
-                if n == 0 && len != 0 {
-                    done.store(true, Relaxed);
-                }
-                Ok(n)
+                Ok(if len == 0 {
+                    hint::spin_loop();
+                    0
+                } else {
+                    let n = input.read_vectored(bufs)?;
+                    if n == 0 {
+                        stop = true;
+                    }
+                    n
+                })
             })?;
 
-            if done.load(Relaxed) {
+            if stop {
+                done.store(true, Relaxed);
                 assert_eq!(reader.position(), DATA_SIZE);
                 return Ok(input);
             }
@@ -43,9 +50,13 @@ fn main() -> io::Result<()> {
     let writer_thread: thread::JoinHandle<io::Result<_>> = thread::Builder::new()
         .name("writer".into())
         .spawn(move || loop {
-            writer.io_slices(|bufs, _len| {
-                let n = output.write_vectored(bufs)?;
-                Ok(n)
+            writer.io_slices(|bufs, len| {
+                Ok(if len == 0 {
+                    hint::spin_loop();
+                    0
+                } else {
+                    output.write_vectored(bufs)?
+                })
             })?;
 
             if writer.is_empty() && done_check.load(Relaxed) {

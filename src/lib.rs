@@ -27,6 +27,7 @@ use ::core::result::Result::{self, Ok};
 use ::core::sync::atomic::AtomicUsize;
 use ::core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use ::core::{assert, assert_eq, assert_ne, debug_assert};
+
 #[cfg(feature = "std")]
 use ::std::io;
 
@@ -96,7 +97,7 @@ unsafe impl Sync for BufferInner {}
 
 impl BufferInner {
     #[inline]
-    fn synced_read<E>(
+    fn read_fn<E>(
         &self,
         mut f: impl FnMut([&mut [u8]; 2], usize) -> Result<usize, E>,
     ) -> Result<usize, E> {
@@ -104,9 +105,14 @@ impl BufferInner {
         let r = self.read.load(Acquire);
 
         let (ranges, len) = empty_ranges(self.data.len(), self.mask, r, w);
+        if len == 0 {
+            // TODO: feature gated WouldBlock
+        }
+
         // SAFETY: ranges are guaranteed to not overlap with any ranges
         //         `synced_write` will use at the same time.
         let bufs = unsafe { self.data.slices_mut(ranges) };
+
         let n = f(bufs, len)?;
         debug_assert!(n <= len, "{n} <= {len}");
 
@@ -115,7 +121,7 @@ impl BufferInner {
     }
 
     #[inline]
-    fn synced_write<E>(
+    fn write_fn<E>(
         &self,
         mut f: impl FnMut([&[u8]; 2], usize) -> Result<usize, E>,
     ) -> Result<usize, E> {
@@ -123,9 +129,14 @@ impl BufferInner {
         let w = self.write.load(Acquire);
 
         let (ranges, len) = filled_ranges(self.data.len(), self.mask, r, w);
+        if len == 0 {
+            // TODO: feature gated WouldBlock
+        }
+
         // SAFETY: ranges are guaranteed to not overlap with any ranges
         //         `synced_read` will use at the same time.
         let bufs = unsafe { self.data.slices(ranges) };
+
         let n = f(bufs, len)?;
         debug_assert!(n <= len, "{n} <= {len}");
 
@@ -212,7 +223,7 @@ impl Reader {
         &self,
         mut f: impl FnMut(&mut [io::IoSliceMut<'_>], usize) -> io::Result<usize>,
     ) -> io::Result<usize> {
-        self.buffer.synced_read(|bufs, len| {
+        self.buffer.read_fn(|bufs, len| {
             let mut bufs = bufs.map(io::IoSliceMut::new);
             f(&mut bufs, len)
         })
@@ -229,7 +240,7 @@ impl Reader {
         &self,
         mut f: impl FnMut(&mut [&mut [u8]], usize) -> Result<usize, E>,
     ) -> Result<usize, E> {
-        self.buffer.synced_read(|mut bufs, len| f(&mut bufs, len))
+        self.buffer.read_fn(|mut bufs, len| f(&mut bufs, len))
     }
 
     #[doc(hidden)]
@@ -282,7 +293,7 @@ impl Writer {
         &self,
         mut f: impl FnMut(&[io::IoSlice<'_>], usize) -> io::Result<usize>,
     ) -> io::Result<usize> {
-        self.buffer.synced_write(|bufs, len| {
+        self.buffer.write_fn(|bufs, len| {
             let bufs = bufs.map(io::IoSlice::new);
             f(&bufs, len)
         })
@@ -299,7 +310,7 @@ impl Writer {
         &self,
         mut f: impl FnMut(&[&[u8]], usize) -> Result<usize, E>,
     ) -> Result<usize, E> {
-        self.buffer.synced_write(|bufs, len| f(&bufs, len))
+        self.buffer.write_fn(|bufs, len| f(&bufs, len))
     }
 
     #[doc(hidden)]
