@@ -1,7 +1,6 @@
 #![deny(
     clippy::undocumented_unsafe_blocks,
     deprecated,
-    rust_2024_compatibility,
     clippy::all,
     clippy::pedantic,
     clippy::nursery
@@ -17,7 +16,7 @@
 
 extern crate alloc;
 
-use ::alloc::alloc::{alloc_zeroed, dealloc, Layout};
+use ::alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use ::alloc::sync::Arc;
 use ::core::clone::Clone;
 use ::core::marker::{PhantomData, Send, Sync};
@@ -27,7 +26,6 @@ use ::core::result::Result::{self, Ok};
 use ::core::sync::atomic::AtomicUsize;
 use ::core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use ::core::{assert, assert_eq, assert_ne, debug_assert};
-
 #[cfg(feature = "std")]
 use ::std::io;
 

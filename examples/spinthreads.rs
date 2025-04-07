@@ -1,7 +1,7 @@
 use std::io::{self, Read, Write};
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::Arc;
 use std::{hint, thread};
 
 use rand::rngs::SmallRng;
@@ -25,43 +25,47 @@ fn main() -> io::Result<()> {
 
     let reader_thread: thread::JoinHandle<io::Result<_>> = thread::Builder::new()
         .name("reader".into())
-        .spawn(move || loop {
-            let mut stop = false;
-            reader.io_slices(|bufs, len| {
-                Ok(if len == 0 {
-                    hint::spin_loop();
-                    0
-                } else {
-                    let n = input.read_vectored(bufs)?;
-                    if n == 0 {
-                        stop = true;
-                    }
-                    n
-                })
-            })?;
+        .spawn(move || {
+            loop {
+                let mut stop = false;
+                reader.io_slices(|bufs, len| {
+                    Ok(if len == 0 {
+                        hint::spin_loop();
+                        0
+                    } else {
+                        let n = input.read_vectored(bufs)?;
+                        if n == 0 {
+                            stop = true;
+                        }
+                        n
+                    })
+                })?;
 
-            if stop {
-                done.store(true, Relaxed);
-                assert_eq!(reader.position(), DATA_SIZE);
-                return Ok(input);
+                if stop {
+                    done.store(true, Relaxed);
+                    assert_eq!(reader.position(), DATA_SIZE);
+                    return Ok(input);
+                }
             }
         })?;
 
     let writer_thread: thread::JoinHandle<io::Result<_>> = thread::Builder::new()
         .name("writer".into())
-        .spawn(move || loop {
-            writer.io_slices(|bufs, len| {
-                Ok(if len == 0 {
-                    hint::spin_loop();
-                    0
-                } else {
-                    output.write_vectored(bufs)?
-                })
-            })?;
+        .spawn(move || {
+            loop {
+                writer.io_slices(|bufs, len| {
+                    Ok(if len == 0 {
+                        hint::spin_loop();
+                        0
+                    } else {
+                        output.write_vectored(bufs)?
+                    })
+                })?;
 
-            if writer.is_empty() && done_check.load(Relaxed) {
-                assert_eq!(writer.position(), DATA_SIZE);
-                return Ok(output);
+                if writer.is_empty() && done_check.load(Relaxed) {
+                    assert_eq!(writer.position(), DATA_SIZE);
+                    return Ok(output);
+                }
             }
         })?;
 
@@ -89,7 +93,7 @@ impl<R: Rng> io::Read for DummyInput<R> {
         let n = if len <= 10 {
             len
         } else {
-            self.rng.gen_range(1..len)
+            self.rng.random_range(1..len)
         };
         self.data -= n;
         Ok(n)
@@ -111,7 +115,7 @@ impl<R: Rng> io::Write for DummyOutput<R> {
         let n = if len <= 10 {
             len
         } else {
-            self.rng.gen_range(0..len)
+            self.rng.random_range(0..len)
         };
         self.data += n;
         Ok(n)
