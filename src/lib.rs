@@ -19,6 +19,7 @@ extern crate alloc;
 use ::alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use ::alloc::sync::Arc;
 use ::core::clone::Clone;
+use ::core::default::Default as _;
 use ::core::marker::{PhantomData, Send, Sync};
 use ::core::ops::{Drop, FnMut, Range};
 use ::core::ptr::{self, NonNull};
@@ -26,6 +27,7 @@ use ::core::result::Result::{self, Ok};
 use ::core::sync::atomic::AtomicUsize;
 use ::core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use ::core::{assert, assert_eq, assert_ne, debug_assert};
+use ::crossbeam_utils::CachePadded;
 #[cfg(feature = "std")]
 use ::std::io;
 
@@ -55,8 +57,8 @@ impl Buffer {
 
         Buffer {
             inner: Arc::new(BufferInner {
-                read: AtomicUsize::new(0),
-                write: AtomicUsize::new(0),
+                read: CachePadded::default(),
+                write: CachePadded::default(),
                 mask,
                 data,
             }),
@@ -83,8 +85,8 @@ impl Buffer {
 // TODO: put data and counters into same heap allocation.
 #[derive(Debug)]
 struct BufferInner {
-    read: AtomicUsize,
-    write: AtomicUsize,
+    read: CachePadded<AtomicUsize>,
+    write: CachePadded<AtomicUsize>,
     mask: usize,
     data: AlignedData,
 }
