@@ -31,60 +31,46 @@ use ::crossbeam_utils::CachePadded;
 #[cfg(feature = "std")]
 use ::std::io;
 
-#[derive(Debug)]
-pub struct Buffer {
-    inner: Arc<BufferInner>,
-}
+/// Creates a reader-writer pair sharing a ring buffer.
+///
+/// # Panics
+///
+/// Will panic if `size` or `align` is not a power of 2.
+#[must_use]
+#[inline]
+pub fn new(size: usize, align: usize) -> (Reader, Writer) {
+    assert!(
+        size.is_power_of_two(), // implies != 0
+        "size is not power of two: {size}"
+    );
+    // TODO: consider accepting any modulus and let compiler optimize
+    //       this into and-ing for power-of-2s.
+    let mask = size - 1;
 
-impl Buffer {
-    /// Creates a new instance of specified `size` (capacity) and alignment.
-    ///
-    /// # Panics
-    ///
-    /// Will panic if `size` or `align` is not a power of 2.
-    #[must_use]
-    #[inline]
-    pub fn new(size: usize, align: usize) -> Self {
-        assert!(
-            size.is_power_of_two(), // implies != 0
-            "size is not power of two: {size}"
-        );
-        // TODO: consider accepting any modulus and let compiler optimize
-        //       this into and-ing for power-of-2s.
-        let mask = size - 1;
+    let data = AlignedData::new(size, align);
 
-        let data = AlignedData::new(size, align);
+    let buffer = Arc::new(Buffer {
+        read: CachePadded::default(),
+        write: CachePadded::default(),
+        mask,
+        data,
+    });
 
-        Buffer {
-            inner: Arc::new(BufferInner {
-                read: CachePadded::default(),
-                write: CachePadded::default(),
-                mask,
-                data,
-            }),
-        }
-    }
+    let reader = Reader {
+        buffer: Arc::clone(&buffer),
+        _notsync: PhantomData,
+    };
+    let writer = Writer {
+        buffer,
+        _notsync: PhantomData,
+    };
 
-    /// Consumes the buffer and splits it into a `Reader` and a `Writer` half
-    /// that can be send to other threads.
-    #[must_use]
-    #[inline]
-    pub fn into_parts(self) -> (Reader, Writer) {
-        let reader = Reader {
-            buffer: Arc::clone(&self.inner),
-            _notsync: PhantomData,
-        };
-        let writer = Writer {
-            buffer: self.inner,
-            _notsync: PhantomData,
-        };
-        (reader, writer)
-    }
+    (reader, writer)
 }
 
 // TODO: put data and counters into same heap allocation.
 #[derive(Debug)]
-struct BufferInner {
+struct Buffer {
     read: CachePadded<AtomicUsize>,
     write: CachePadded<AtomicUsize>,
     mask: usize,
@@ -93,9 +79,9 @@ struct BufferInner {
 
 // SAFETY: Sync is safe because slices of data are guaranteed to not be aliased.
 // TODO: make data sync, if possible. And switch to `SyncUnsafeCell`.
-unsafe impl Sync for BufferInner {}
+unsafe impl Sync for Buffer {}
 
-impl BufferInner {
+impl Buffer {
     #[inline]
     fn read_fn<E>(
         &self,
@@ -199,7 +185,7 @@ const fn empty_ranges(
 
 #[derive(Debug)]
 pub struct Reader {
-    buffer: Arc<BufferInner>,
+    buffer: Arc<Buffer>,
     _notsync: PhantomData<*mut ()>,
 }
 
@@ -269,7 +255,7 @@ impl io::Write for Reader {
 
 #[derive(Debug)]
 pub struct Writer {
-    buffer: Arc<BufferInner>,
+    buffer: Arc<Buffer>,
     _notsync: PhantomData<*mut ()>,
 }
 
@@ -439,7 +425,7 @@ mod tests {
 
     use super::*;
 
-    assert_impl_all!(BufferInner: Send, Sync);
+    assert_impl_all!(Buffer: Send, Sync);
     assert_impl_all!(Reader: Send);
     assert_not_impl_any!(Reader: Sync);
     assert_impl_all!(Writer: Send);

@@ -16,20 +16,17 @@ buffer does not offer any advantages.
 ## Usage
 
 ```rust
-let buffer = bytering::Buffer::new(4096, 4096);
-let (reader, writer) = buffer.into_parts();
+let (reader, writer) = bytering::new(4096, 4096);
 
 let r = reader.io_slices(|bufs, _len| {
     let r = input.read_vectored(bufs)?;
     Ok(r)
 })?;
-// -or- reader.io_slices(|bufs, _| input.read_vectored(bufs))?;
 
 let w = writer.io_slices(|bufs, _len| {
     let w = output.write_vectored(bufs)?;
     Ok(w)
 })?;
-// -or- writer.io_slices(|bufs, _| output.write_vectored(bufs))?;
 ```
 
 ## Locking
