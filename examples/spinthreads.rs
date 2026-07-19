@@ -6,7 +6,7 @@ use std::{hint, thread};
 
 use bytering::{ConsumerError, ProducerError};
 use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngExt as _, SeedableRng};
 
 fn main() -> io::Result<()> {
     const DATA_SIZE: usize = 10 << 30;
