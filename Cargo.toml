@@ -2,6 +2,7 @@
 name = "bytering"
 version = "0.7.0"
 edition = "2024"
+rust-version = "1.95"
 description = "A ring buffer specialized for vectored reading and writing in blocking and async I/O"
 authors = ["Folke <folke@gmail.com>"]
 license = "MIT OR Apache-2.0"
@@ -21,10 +22,14 @@ crossbeam-utils = "0.8"
 rand = { version = "0.9", features = ["small_rng"] }
 static_assertions = "1"
 
+[[example]]
+name = "spinthreads"
+required-features = ["std"]
+
 [profile.release]
 lto = true
 opt-level = 3
-debug-assertions = true
+debug-assertions = false
 overflow-checks = true
 codegen-units = 1
 panic = "abort"

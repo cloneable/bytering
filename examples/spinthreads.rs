@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 use std::{hint, thread};
 
+use bytering::BufferError;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
@@ -28,18 +29,23 @@ fn main() -> io::Result<()> {
         .spawn(move || {
             loop {
                 let mut stop = false;
-                reader.io_slices(|bufs, len| {
-                    Ok(if len == 0 {
-                        hint::spin_loop();
-                        0
-                    } else {
-                        let n = input.read_vectored(bufs)?;
-                        if n == 0 {
-                            stop = true;
-                        }
-                        n
+                reader
+                    .io_slices(|bufs, len| {
+                        Ok(if len == 0 {
+                            hint::spin_loop();
+                            0
+                        } else {
+                            let n = input.read_vectored(bufs)?;
+                            if n == 0 {
+                                stop = true;
+                            }
+                            n
+                        })
                     })
-                })?;
+                    .map_err(|err| match err {
+                        BufferError::Callback(err) => err,
+                        err @ BufferError::InvalidCount { .. } => invalid_count_panic(err),
+                    })?;
 
                 if stop {
                     done.store(true, Relaxed);
@@ -53,14 +59,19 @@ fn main() -> io::Result<()> {
         .name("writer".into())
         .spawn(move || {
             loop {
-                writer.io_slices(|bufs, len| {
-                    Ok(if len == 0 {
-                        hint::spin_loop();
-                        0
-                    } else {
-                        output.write_vectored(bufs)?
+                writer
+                    .io_slices(|bufs, len| {
+                        Ok(if len == 0 {
+                            hint::spin_loop();
+                            0
+                        } else {
+                            output.write_vectored(bufs)?
+                        })
                     })
-                })?;
+                    .map_err(|err| match err {
+                        BufferError::Callback(err) => err,
+                        err @ BufferError::InvalidCount { .. } => invalid_count_panic(err),
+                    })?;
 
                 if writer.is_empty() && done_check.load(Relaxed) {
                     assert_eq!(writer.position(), DATA_SIZE);
@@ -76,6 +87,12 @@ fn main() -> io::Result<()> {
     assert_eq!(output.data, DATA_SIZE);
 
     Ok(())
+}
+
+#[cold]
+#[inline(never)]
+fn invalid_count_panic(err: BufferError<io::Error>) -> ! {
+    panic!("{err}");
 }
 
 struct DummyInput<R: Rng> {

@@ -20,13 +20,16 @@ use ::alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use ::alloc::sync::Arc;
 use ::core::clone::Clone;
 use ::core::default::Default as _;
+use ::core::fmt;
+use ::core::hint;
 use ::core::marker::{PhantomData, Send, Sync};
 use ::core::ops::{Drop, FnMut, Range};
+use ::core::option::Option::{self, None};
 use ::core::ptr::{self, NonNull};
-use ::core::result::Result::{self, Ok};
+use ::core::result::Result::{self, Err, Ok};
 use ::core::sync::atomic::AtomicUsize;
 use ::core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use ::core::{assert, assert_eq, assert_ne, debug_assert};
+use ::core::{assert, assert_eq, assert_ne, debug_assert, write};
 use ::crossbeam_utils::CachePadded;
 #[cfg(feature = "std")]
 use ::std::io;
@@ -86,7 +89,7 @@ impl Buffer {
     fn read_fn<E>(
         &self,
         mut f: impl FnMut([&mut [u8]; 2], usize) -> Result<usize, E>,
-    ) -> Result<usize, E> {
+    ) -> Result<usize, BufferError<E>> {
         let w = self.write.load(Relaxed);
         let r = self.read.load(Acquire);
 
@@ -99,8 +102,11 @@ impl Buffer {
         //         `synced_write` will use at the same time.
         let bufs = unsafe { self.data.slices_mut(ranges) };
 
-        let n = f(bufs, len)?;
-        debug_assert!(n <= len, "{n} <= {len}");
+        let n = f(bufs, len).map_err(BufferError::Callback)?;
+        if n > len {
+            hint::cold_path();
+            return Err(BufferError::InvalidCount { n, len });
+        }
 
         self.write.store(w.checked_add(n).unwrap(), Release);
         Ok(n)
@@ -110,7 +116,7 @@ impl Buffer {
     fn write_fn<E>(
         &self,
         mut f: impl FnMut([&[u8]; 2], usize) -> Result<usize, E>,
-    ) -> Result<usize, E> {
+    ) -> Result<usize, BufferError<E>> {
         let r = self.read.load(Relaxed);
         let w = self.write.load(Acquire);
 
@@ -123,11 +129,57 @@ impl Buffer {
         //         `synced_read` will use at the same time.
         let bufs = unsafe { self.data.slices(ranges) };
 
-        let n = f(bufs, len)?;
-        debug_assert!(n <= len, "{n} <= {len}");
+        let n = f(bufs, len).map_err(BufferError::Callback)?;
+        if n > len {
+            hint::cold_path();
+            return Err(BufferError::InvalidCount { n, len });
+        }
 
         self.read.store(r.checked_add(n).unwrap(), Release);
         Ok(n)
+    }
+}
+
+/// The error type returned by the slice-vending methods of [`Reader`] and
+/// [`Writer`].
+#[derive(Debug, Clone)]
+pub enum BufferError<E> {
+    /// The callback (the closure or function passed in) failed. Its error
+    /// is passed through unchanged.
+    Callback(E),
+    /// The callback returned a count exceeding the length it was offered.
+    /// The count was discarded and the buffer is unchanged, so the half
+    /// stays usable.
+    InvalidCount {
+        /// The count the callback returned.
+        n: usize,
+        /// The total length the callback was offered.
+        len: usize,
+    },
+}
+
+impl<E: fmt::Display> fmt::Display for BufferError<E> {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BufferError::Callback(e) => fmt::Display::fmt(e, f),
+            BufferError::InvalidCount { n, len } => {
+                write!(
+                    f,
+                    "callback returned a count of {n}, but only {len} bytes were available"
+                )
+            }
+        }
+    }
+}
+
+impl<E: ::core::error::Error> ::core::error::Error for BufferError<E> {
+    #[inline]
+    fn source(&self) -> Option<&(dyn ::core::error::Error + 'static)> {
+        match self {
+            BufferError::Callback(e) => e.source(),
+            BufferError::InvalidCount { .. } => None,
+        }
     }
 }
 
@@ -202,13 +254,15 @@ impl Reader {
     ///
     /// # Errors
     ///
-    /// Returns the error from the closure unchanged.
+    /// Returns [`BufferError::Callback`] with the closure's error unchanged, or
+    /// [`BufferError::InvalidCount`] if the closure returned a count greater
+    /// than the total length it was given.
     #[cfg(feature = "std")]
     #[inline]
     pub fn io_slices(
         &self,
         mut f: impl FnMut(&mut [io::IoSliceMut<'_>], usize) -> io::Result<usize>,
-    ) -> io::Result<usize> {
+    ) -> Result<usize, BufferError<io::Error>> {
         self.buffer.read_fn(|bufs, len| {
             let mut bufs = bufs.map(io::IoSliceMut::new);
             f(&mut bufs, len)
@@ -220,12 +274,14 @@ impl Reader {
     ///
     /// # Errors
     ///
-    /// Returns the error from the closure unchanged.
+    /// Returns [`BufferError::Callback`] with the closure's error unchanged, or
+    /// [`BufferError::InvalidCount`] if the closure returned a count greater
+    /// than the total length it was given.
     #[inline]
     pub fn slices<E>(
         &self,
         mut f: impl FnMut(&mut [&mut [u8]], usize) -> Result<usize, E>,
-    ) -> Result<usize, E> {
+    ) -> Result<usize, BufferError<E>> {
         self.buffer.read_fn(|mut bufs, len| f(&mut bufs, len))
     }
 
@@ -244,7 +300,11 @@ impl io::Write for Reader {
     fn write(&mut self, src: &[u8]) -> io::Result<usize> {
         use io::Read;
         let mut src = io::Cursor::new(src);
-        self.io_slices(move |dsts, _| src.read_vectored(dsts))
+        match self.io_slices(move |dsts, _| src.read_vectored(dsts)) {
+            Ok(n) => Ok(n),
+            Err(BufferError::Callback(e)) => Err(e),
+            Err(err @ BufferError::InvalidCount { .. }) => Err(io::Error::other(err)),
+        }
     }
 
     #[inline]
@@ -272,13 +332,15 @@ impl Writer {
     ///
     /// # Errors
     ///
-    /// Returns the error from the closure unchanged.
+    /// Returns [`BufferError::Callback`] with the closure's error unchanged, or
+    /// [`BufferError::InvalidCount`] if the closure returned a count greater
+    /// than the total length it was given.
     #[cfg(feature = "std")]
     #[inline]
     pub fn io_slices(
         &self,
         mut f: impl FnMut(&[io::IoSlice<'_>], usize) -> io::Result<usize>,
-    ) -> io::Result<usize> {
+    ) -> Result<usize, BufferError<io::Error>> {
         self.buffer.write_fn(|bufs, len| {
             let bufs = bufs.map(io::IoSlice::new);
             f(&bufs, len)
@@ -290,12 +352,14 @@ impl Writer {
     ///
     /// # Errors
     ///
-    /// Returns the error from the closure unchanged.
+    /// Returns [`BufferError::Callback`] with the closure's error unchanged, or
+    /// [`BufferError::InvalidCount`] if the closure returned a count greater
+    /// than the total length it was given.
     #[inline]
     pub fn slices<E>(
         &self,
         mut f: impl FnMut(&[&[u8]], usize) -> Result<usize, E>,
-    ) -> Result<usize, E> {
+    ) -> Result<usize, BufferError<E>> {
         self.buffer.write_fn(|bufs, len| f(&bufs, len))
     }
 
@@ -323,7 +387,11 @@ impl io::Read for Writer {
     fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
         use io::Write;
         let mut dst = io::Cursor::new(dst);
-        self.io_slices(move |srcs, _| dst.write_vectored(srcs))
+        match self.io_slices(move |srcs, _| dst.write_vectored(srcs)) {
+            Ok(n) => Ok(n),
+            Err(BufferError::Callback(e)) => Err(e),
+            Err(err @ BufferError::InvalidCount { .. }) => Err(io::Error::other(err)),
+        }
     }
 }
 
@@ -388,6 +456,10 @@ impl AlignedData {
     ///   `slices` or `slices_mut` at the same time.
     #[must_use]
     #[inline]
+    #[expect(
+        clippy::mut_from_ref,
+        reason = "aliasing is ruled out by the # Safety contract"
+    )]
     unsafe fn slices_mut(&self, ranges: [Range<usize>; 2]) -> [&mut [u8]; 2] {
         // SAFETY: the pointer is acquired through alloc_zeroed and is checked
         //         to be non-null. Provided the safety rules of the method are
@@ -421,6 +493,7 @@ const fn range_len(r: &Range<usize>) -> usize {
 #[cfg(test)]
 mod tests {
     use ::core::marker::{Send, Sized, Sync};
+    use ::core::matches;
     use ::static_assertions::{assert_impl_all, assert_not_impl_any};
 
     use super::*;
@@ -534,5 +607,44 @@ mod tests {
         );
         assert_eq!(bufs[1].len(), 0);
         assert_eq!(len, 16);
+    }
+
+    #[test]
+    fn reader_invalid_count_errors() {
+        let (reader, _writer) = new(16, 16);
+        let res = reader.slices(|_bufs, len| Ok::<_, ()>(len + 1));
+        assert!(matches!(
+            res,
+            Err(BufferError::InvalidCount { n: 17, len: 16 })
+        ));
+
+        // The invalid count was discarded; the half stays usable.
+        let n = reader.slices(|_bufs, len| Ok::<_, ()>(len)).unwrap();
+        assert_eq!(n, 16);
+        assert_eq!(reader.position(), 16);
+    }
+
+    #[test]
+    fn writer_invalid_count_errors() {
+        let (reader, writer) = new(16, 16);
+        reader.slices(|_bufs, _len| Ok::<_, ()>(4)).unwrap();
+        let res = writer.slices(|_bufs, len| Ok::<_, ()>(len + 1));
+        assert!(matches!(
+            res,
+            Err(BufferError::InvalidCount { n: 5, len: 4 })
+        ));
+
+        // The invalid count was discarded; the half stays usable.
+        let n = writer.slices(|_bufs, len| Ok::<_, ()>(len)).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(writer.position(), 4);
+    }
+
+    #[test]
+    fn callback_error_passes_through() {
+        let (reader, _writer) = new(16, 16);
+        let res = reader.slices(|_bufs, _len| Err::<usize, i32>(-1));
+        assert!(matches!(res, Err(BufferError::Callback(-1))));
+        assert_eq!(reader.position(), 0);
     }
 }
