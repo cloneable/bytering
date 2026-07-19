@@ -24,33 +24,35 @@ use ::core::fmt;
 use ::core::hint;
 use ::core::marker::{PhantomData, Send, Sync};
 use ::core::ops::{Drop, FnMut, Range};
-use ::core::option::Option::{self, None};
+use ::core::option::Option::{self, None, Some};
 use ::core::ptr::{self, NonNull};
 use ::core::result::Result::{self, Err, Ok};
 use ::core::sync::atomic::AtomicUsize;
 use ::core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use ::core::{assert, assert_eq, assert_ne, debug_assert, write};
+use ::core::{debug_assert, write};
 use ::crossbeam_utils::CachePadded;
 #[cfg(feature = "std")]
 use ::std::io;
 
 /// Creates a producer-consumer pair sharing a ring buffer.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Will panic if `size` or `align` is not a power of 2.
-#[must_use]
+/// Returns an error when `size` or `align` is not a power of two, or when
+/// the allocation fails.
 #[inline]
-pub fn new(size: usize, align: usize) -> (Producer, Consumer) {
-    assert!(
-        size.is_power_of_two(), // implies != 0
-        "size is not power of two: {size}"
-    );
-    // TODO: consider accepting any modulus and let compiler optimize
-    //       this into and-ing for power-of-2s.
-    let mask = size - 1;
+pub fn new(size: usize, align: usize) -> Result<(Producer, Consumer), BufferError> {
+    // implies != 0
+    if !size.is_power_of_two() {
+        return Err(BufferError::BadSize(size));
+    }
+    if !align.is_power_of_two() {
+        return Err(BufferError::BadAlignment(align));
+    }
 
-    let data = AlignedData::new(size, align);
+    let mask = size.wrapping_sub(1);
+
+    let data = AlignedData::new(size, align)?;
 
     let buffer = Arc::new(Buffer {
         read: CachePadded::default(),
@@ -68,7 +70,7 @@ pub fn new(size: usize, align: usize) -> (Producer, Consumer) {
         _notsync: PhantomData,
     };
 
-    (producer, consumer)
+    Ok((producer, consumer))
 }
 
 // TODO: put data and counters into same heap allocation.
@@ -87,8 +89,8 @@ struct Buffer {
 //         them while its slices are live, and the counter protocol keeps the
 //         producer's empty ranges and the consumer's filled ranges disjoint.
 //         A callback's returned count is checked against the offered length
-//         before a counter is advanced, so `read <= write <= read + size`
-//         holds even with a buggy callback.
+//         before a counter is advanced, so the wrapping distance
+//         `write - read` stays within `0..=size` even with a buggy callback.
 unsafe impl Sync for Buffer {}
 
 impl Buffer {
@@ -96,7 +98,7 @@ impl Buffer {
     fn produce_fn<E>(
         &self,
         mut f: impl FnMut([&mut [u8]; 2], usize) -> Result<usize, E>,
-    ) -> Result<usize, BufferError<E>> {
+    ) -> Result<usize, ProducerError<E>> {
         let w = self.write.load(Relaxed);
         let r = self.read.load(Acquire);
 
@@ -110,13 +112,16 @@ impl Buffer {
         //         same time.
         let bufs = unsafe { self.data.slices_mut(ranges) };
 
-        let n = f(bufs, len).map_err(BufferError::Callback)?;
+        let n = f(bufs, len).map_err(ProducerError::Callback)?;
         if n > len {
             hint::cold_path();
-            return Err(BufferError::InvalidCount { n, len });
+            return Err(ProducerError::InvalidCount { n, len });
         }
 
-        self.write.store(w.checked_add(n).unwrap(), Release);
+        if n != 0 {
+            self.write.store(w.wrapping_add(n), Release);
+        }
+
         Ok(n)
     }
 
@@ -124,7 +129,7 @@ impl Buffer {
     fn consume_fn<E>(
         &self,
         mut f: impl FnMut([&[u8]; 2], usize) -> Result<usize, E>,
-    ) -> Result<usize, BufferError<E>> {
+    ) -> Result<usize, ConsumerError<E>> {
         let r = self.read.load(Relaxed);
         let w = self.write.load(Acquire);
 
@@ -138,21 +143,23 @@ impl Buffer {
         //         same time.
         let bufs = unsafe { self.data.slices(ranges) };
 
-        let n = f(bufs, len).map_err(BufferError::Callback)?;
+        let n = f(bufs, len).map_err(ConsumerError::Callback)?;
         if n > len {
             hint::cold_path();
-            return Err(BufferError::InvalidCount { n, len });
+            return Err(ConsumerError::InvalidCount { n, len });
         }
 
-        self.read.store(r.checked_add(n).unwrap(), Release);
+        if n != 0 {
+            self.read.store(r.wrapping_add(n), Release);
+        }
+
         Ok(n)
     }
 }
 
-/// The error type returned by the slice-vending methods of [`Producer`] and
-/// [`Consumer`].
+/// The error type returned by the slice-vending methods of [`Producer`].
 #[derive(Debug, Clone)]
-pub enum BufferError<E> {
+pub enum ProducerError<E> {
     /// The callback (the closure or function passed in) failed. Its error
     /// is passed through unchanged.
     Callback(E),
@@ -167,12 +174,12 @@ pub enum BufferError<E> {
     },
 }
 
-impl<E: fmt::Display> fmt::Display for BufferError<E> {
+impl<E: fmt::Display> fmt::Display for ProducerError<E> {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BufferError::Callback(e) => fmt::Display::fmt(e, f),
-            BufferError::InvalidCount { n, len } => {
+            ProducerError::Callback(e) => fmt::Display::fmt(e, f),
+            ProducerError::InvalidCount { n, len } => {
                 write!(
                     f,
                     "callback returned a count of {n}, but only {len} bytes were available"
@@ -182,15 +189,85 @@ impl<E: fmt::Display> fmt::Display for BufferError<E> {
     }
 }
 
-impl<E: ::core::error::Error> ::core::error::Error for BufferError<E> {
+impl<E: ::core::error::Error> ::core::error::Error for ProducerError<E> {
     #[inline]
     fn source(&self) -> Option<&(dyn ::core::error::Error + 'static)> {
         match self {
-            BufferError::Callback(e) => e.source(),
-            BufferError::InvalidCount { .. } => None,
+            ProducerError::Callback(e) => e.source(),
+            ProducerError::InvalidCount { .. } => None,
         }
     }
 }
+
+/// The error type returned by the slice-vending methods of [`Consumer`].
+#[derive(Debug, Clone)]
+pub enum ConsumerError<E> {
+    /// The callback (the closure or function passed in) failed. Its error
+    /// is passed through unchanged.
+    Callback(E),
+    /// The callback returned a count exceeding the length it was offered.
+    /// The count was discarded and the buffer is unchanged, so the half
+    /// stays usable.
+    InvalidCount {
+        /// The count the callback returned.
+        n: usize,
+        /// The total length the callback was offered.
+        len: usize,
+    },
+}
+
+impl<E: fmt::Display> fmt::Display for ConsumerError<E> {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConsumerError::Callback(e) => fmt::Display::fmt(e, f),
+            ConsumerError::InvalidCount { n, len } => {
+                write!(
+                    f,
+                    "callback returned a count of {n}, but only {len} bytes were available"
+                )
+            }
+        }
+    }
+}
+
+impl<E: ::core::error::Error> ::core::error::Error for ConsumerError<E> {
+    #[inline]
+    fn source(&self) -> Option<&(dyn ::core::error::Error + 'static)> {
+        match self {
+            ConsumerError::Callback(e) => e.source(),
+            ConsumerError::InvalidCount { .. } => None,
+        }
+    }
+}
+
+/// The error type returned by [`new`].
+#[derive(Debug, Clone)]
+pub enum BufferError {
+    /// The requested size is not a power of two, or too large to allocate.
+    BadSize(usize),
+    /// The requested alignment is not a power of two.
+    BadAlignment(usize),
+    /// The allocator failed to provide the requested memory.
+    AllocFailed,
+}
+
+impl fmt::Display for BufferError {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BufferError::BadSize(size) => {
+                write!(f, "size is not a power of two or too large: {size}")
+            }
+            BufferError::BadAlignment(align) => {
+                write!(f, "alignment is not a power of two: {align}")
+            }
+            BufferError::AllocFailed => write!(f, "allocation failed"),
+        }
+    }
+}
+
+impl ::core::error::Error for BufferError {}
 
 #[must_use]
 #[inline]
@@ -200,12 +277,11 @@ const fn filled_ranges(
     read: usize,
     write: usize,
 ) -> ([Range<usize>; 2], usize) {
-    debug_assert!(read <= write);
-    debug_assert!(write <= read + buflen);
+    debug_assert!(write.wrapping_sub(read) <= buflen);
 
-    let len = write - read;
+    let len = write.wrapping_sub(read);
     let start = read & mask;
-    let end = start + len;
+    let end = start.wrapping_add(len);
     let endw = end & mask;
 
     let ranges = if end == endw {
@@ -226,12 +302,11 @@ const fn empty_ranges(
     read: usize,
     write: usize,
 ) -> ([Range<usize>; 2], usize) {
-    debug_assert!(read <= write);
-    debug_assert!(write <= read + buflen);
+    debug_assert!(write.wrapping_sub(read) <= buflen);
 
-    let len = buflen - (write - read);
+    let len = buflen.wrapping_sub(write.wrapping_sub(read));
     let start = write & mask;
-    let end = start + len;
+    let end = start.wrapping_add(len);
     let endw = end & mask;
 
     let ranges = if end == endw {
@@ -263,15 +338,15 @@ impl Producer {
     ///
     /// # Errors
     ///
-    /// Returns [`BufferError::Callback`] with the closure's error unchanged, or
-    /// [`BufferError::InvalidCount`] if the closure returned a count greater
-    /// than the total length it was given.
+    /// Returns [`ProducerError::Callback`] with the closure's error
+    /// unchanged, or [`ProducerError::InvalidCount`] if the closure returned
+    /// a count greater than the total length it was given.
     #[cfg(feature = "std")]
     #[inline]
     pub fn io_slices(
         &mut self,
         mut f: impl FnMut(&mut [io::IoSliceMut<'_>], usize) -> io::Result<usize>,
-    ) -> Result<usize, BufferError<io::Error>> {
+    ) -> Result<usize, ProducerError<io::Error>> {
         self.buffer.produce_fn(|bufs, len| {
             let mut bufs = bufs.map(io::IoSliceMut::new);
             f(&mut bufs, len)
@@ -284,14 +359,14 @@ impl Producer {
     ///
     /// # Errors
     ///
-    /// Returns [`BufferError::Callback`] with the closure's error unchanged, or
-    /// [`BufferError::InvalidCount`] if the closure returned a count greater
-    /// than the total length it was given.
+    /// Returns [`ProducerError::Callback`] with the closure's error
+    /// unchanged, or [`ProducerError::InvalidCount`] if the closure returned
+    /// a count greater than the total length it was given.
     #[inline]
     pub fn slices<E>(
         &mut self,
         mut f: impl FnMut(&mut [&mut [u8]], usize) -> Result<usize, E>,
-    ) -> Result<usize, BufferError<E>> {
+    ) -> Result<usize, ProducerError<E>> {
         self.buffer.produce_fn(|mut bufs, len| f(&mut bufs, len))
     }
 
@@ -312,8 +387,8 @@ impl io::Write for Producer {
         let mut src = io::Cursor::new(src);
         match self.io_slices(move |dsts, _| src.read_vectored(dsts)) {
             Ok(n) => Ok(n),
-            Err(BufferError::Callback(e)) => Err(e),
-            Err(err @ BufferError::InvalidCount { .. }) => Err(io::Error::other(err)),
+            Err(ProducerError::Callback(e)) => Err(e),
+            Err(err @ ProducerError::InvalidCount { .. }) => Err(io::Error::other(err)),
         }
     }
 
@@ -338,15 +413,15 @@ impl Consumer {
     ///
     /// # Errors
     ///
-    /// Returns [`BufferError::Callback`] with the closure's error unchanged, or
-    /// [`BufferError::InvalidCount`] if the closure returned a count greater
-    /// than the total length it was given.
+    /// Returns [`ConsumerError::Callback`] with the closure's error
+    /// unchanged, or [`ConsumerError::InvalidCount`] if the closure returned
+    /// a count greater than the total length it was given.
     #[cfg(feature = "std")]
     #[inline]
     pub fn io_slices(
         &mut self,
         mut f: impl FnMut(&[io::IoSlice<'_>], usize) -> io::Result<usize>,
-    ) -> Result<usize, BufferError<io::Error>> {
+    ) -> Result<usize, ConsumerError<io::Error>> {
         self.buffer.consume_fn(|bufs, len| {
             let bufs = bufs.map(io::IoSlice::new);
             f(&bufs, len)
@@ -359,14 +434,14 @@ impl Consumer {
     ///
     /// # Errors
     ///
-    /// Returns [`BufferError::Callback`] with the closure's error unchanged, or
-    /// [`BufferError::InvalidCount`] if the closure returned a count greater
-    /// than the total length it was given.
+    /// Returns [`ConsumerError::Callback`] with the closure's error
+    /// unchanged, or [`ConsumerError::InvalidCount`] if the closure returned
+    /// a count greater than the total length it was given.
     #[inline]
     pub fn slices<E>(
         &mut self,
         mut f: impl FnMut(&[&[u8]], usize) -> Result<usize, E>,
-    ) -> Result<usize, BufferError<E>> {
+    ) -> Result<usize, ConsumerError<E>> {
         self.buffer.consume_fn(|bufs, len| f(&bufs, len))
     }
 
@@ -396,8 +471,8 @@ impl io::Read for Consumer {
         let mut dst = io::Cursor::new(dst);
         match self.io_slices(move |srcs, _| dst.write_vectored(srcs)) {
             Ok(n) => Ok(n),
-            Err(BufferError::Callback(e)) => Err(e),
-            Err(err @ BufferError::InvalidCount { .. }) => Err(io::Error::other(err)),
+            Err(ConsumerError::Callback(e)) => Err(e),
+            Err(err @ ConsumerError::InvalidCount { .. }) => Err(io::Error::other(err)),
         }
     }
 }
@@ -415,19 +490,25 @@ unsafe impl Send for AlignedData {}
 
 impl AlignedData {
     #[inline]
-    fn new(size: usize, align: usize) -> Self {
-        assert_ne!(size, 0, "size cannot be zero");
+    fn new(size: usize, align: usize) -> Result<Self, BufferError> {
+        debug_assert!(size != 0, "size cannot be zero");
 
-        let layout = Layout::from_size_align(size, align).unwrap();
+        let Ok(layout) = Layout::from_size_align(size, align) else {
+            return Err(BufferError::BadSize(size));
+        };
 
         // SAFETY: alloc is called with a correct layout with a non-zero size.
-        //         A null pointer is immediately handled.
-        let ptr = unsafe { NonNull::new(alloc_zeroed(layout)).unwrap() };
+        //         A null pointer is handled right below.
+        let Some(ptr) = NonNull::new(unsafe { alloc_zeroed(layout) }) else {
+            return Err(BufferError::AllocFailed);
+        };
 
-        let addr = ptr.as_ptr() as usize;
-        assert_eq!(addr % align, 0, "aligned alloc failed");
+        debug_assert!(
+            (ptr.as_ptr() as usize).is_multiple_of(align),
+            "aligned alloc failed"
+        );
 
-        AlignedData { ptr, layout }
+        Ok(AlignedData { ptr, layout })
     }
 
     #[must_use]
@@ -494,7 +575,7 @@ impl Drop for AlignedData {
 
 const fn range_len(r: &Range<usize>) -> usize {
     debug_assert!(r.start <= r.end);
-    r.end - r.start
+    r.end.wrapping_sub(r.start)
 }
 
 #[cfg(test)]
@@ -502,7 +583,7 @@ mod tests {
     use ::core::cmp::Ord;
     use ::core::convert::{From as _, TryFrom as _};
     use ::core::marker::{Send, Sized, Sync};
-    use ::core::matches;
+    use ::core::{assert, assert_eq, matches};
     use ::static_assertions::{assert_impl_all, assert_not_impl_any};
 
     use super::*;
@@ -568,6 +649,16 @@ mod tests {
         assert_eq!(bufs[0].len(), 0);
         assert_eq!(bufs[1].len(), 0);
         assert_eq!(len, 0);
+
+        // The write counter has wrapped around zero, the read counter has
+        // not yet: write is numerically smaller than read.
+        let read = usize::MAX - 5;
+        let write = read.wrapping_add(9);
+        let (ranges, len) = filled_ranges(data.len(), mask, read, write);
+        let bufs = ranges.map(|r| &data[r]);
+        assert_eq!(bufs[0], &[10, 11, 12, 13, 14, 15]);
+        assert_eq!(bufs[1], &[0, 1, 2]);
+        assert_eq!(len, 9);
     }
 
     #[test]
@@ -616,25 +707,54 @@ mod tests {
         );
         assert_eq!(bufs[1].len(), 0);
         assert_eq!(len, 16);
+
+        // The write counter has wrapped around zero, the read counter has
+        // not yet: write is numerically smaller than read.
+        let read = usize::MAX - 5;
+        let write = read.wrapping_add(9);
+        let (ranges, len) = empty_ranges(data.len(), mask, read, write);
+        let bufs = ranges.map(|r| &data[r]);
+        assert_eq!(bufs[0], &[3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(bufs[1].len(), 0);
+        assert_eq!(len, 7);
     }
 
-    #[test]
-    fn roundtrip_pattern_across_wraps() {
-        const RING: usize = 16;
-        const TOTAL: usize = 200;
+    const RING: usize = 16;
+
+    /// Builds a pair over a 16-byte ring whose counters both start at
+    /// `start`, to exercise arbitrary counter positions.
+    fn seeded_pair(start: usize) -> (Producer, Consumer) {
+        let buffer = Arc::new(Buffer {
+            read: CachePadded::new(AtomicUsize::new(start)),
+            write: CachePadded::new(AtomicUsize::new(start)),
+            mask: RING - 1,
+            data: AlignedData::new(RING, RING).unwrap(),
+        });
+        let producer = Producer {
+            buffer: Arc::clone(&buffer),
+            _notsync: PhantomData,
+        };
+        let consumer = Consumer {
+            buffer,
+            _notsync: PhantomData,
+        };
+        (producer, consumer)
+    }
+
+    /// Pumps `total` bytes of a position-dependent pattern through the pair
+    /// with odd chunk sizes, verifying every byte on the way out.
+    fn pump_pattern(producer: &mut Producer, consumer: &mut Consumer, total: usize) {
         const PRODUCE_MAX: usize = 11;
         const CONSUME_MAX: usize = 7;
-
-        let (mut producer, mut consumer) = new(RING, RING);
 
         let mut written = 0;
         let mut read = 0;
 
-        while read < TOTAL {
-            if written < TOTAL {
+        while read < total {
+            if written < total {
                 let n = producer
                     .slices(|bufs, len| {
-                        let cap = len.min(PRODUCE_MAX).min(TOTAL - written);
+                        let cap = len.min(PRODUCE_MAX).min(total - written);
                         let mut n = 0;
                         'bufs: for buf in bufs.iter_mut() {
                             for b in buf.iter_mut() {
@@ -672,20 +792,44 @@ mod tests {
             read += n;
         }
 
-        assert_eq!(written, TOTAL);
-        assert_eq!(read, TOTAL);
+        assert_eq!(written, total);
+        assert_eq!(read, total);
+    }
+
+    #[test]
+    fn roundtrip_pattern_across_wraps() {
+        const TOTAL: usize = 200;
+
+        let (mut producer, mut consumer) = new(RING, RING).unwrap();
+        pump_pattern(&mut producer, &mut consumer, TOTAL);
+
         assert_eq!(producer.position(), TOTAL);
         assert_eq!(consumer.position(), TOTAL);
         assert!(consumer.is_empty());
     }
 
     #[test]
+    fn roundtrip_across_counter_wrap() {
+        const TOTAL: usize = 200;
+        // The write counter wraps around zero mid-run while the read counter
+        // is still near the top of the usize range.
+        const START: usize = usize::MAX - 99;
+
+        let (mut producer, mut consumer) = seeded_pair(START);
+        pump_pattern(&mut producer, &mut consumer, TOTAL);
+
+        assert_eq!(producer.position(), START.wrapping_add(TOTAL));
+        assert_eq!(consumer.position(), START.wrapping_add(TOTAL));
+        assert!(consumer.is_empty());
+    }
+
+    #[test]
     fn producer_invalid_count_errors() {
-        let (mut producer, _consumer) = new(16, 16);
+        let (mut producer, _consumer) = new(16, 16).unwrap();
         let res = producer.slices(|_bufs, len| Ok::<_, ()>(len + 1));
         assert!(matches!(
             res,
-            Err(BufferError::InvalidCount { n: 17, len: 16 })
+            Err(ProducerError::InvalidCount { n: 17, len: 16 })
         ));
 
         // The invalid count was discarded; the half stays usable.
@@ -696,12 +840,12 @@ mod tests {
 
     #[test]
     fn consumer_invalid_count_errors() {
-        let (mut producer, mut consumer) = new(16, 16);
+        let (mut producer, mut consumer) = new(16, 16).unwrap();
         producer.slices(|_bufs, _len| Ok::<_, ()>(4)).unwrap();
         let res = consumer.slices(|_bufs, len| Ok::<_, ()>(len + 1));
         assert!(matches!(
             res,
-            Err(BufferError::InvalidCount { n: 5, len: 4 })
+            Err(ConsumerError::InvalidCount { n: 5, len: 4 })
         ));
 
         // The invalid count was discarded; the half stays usable.
@@ -712,9 +856,16 @@ mod tests {
 
     #[test]
     fn callback_error_passes_through() {
-        let (mut producer, _consumer) = new(16, 16);
+        let (mut producer, _consumer) = new(16, 16).unwrap();
         let res = producer.slices(|_bufs, _len| Err::<usize, i32>(-1));
-        assert!(matches!(res, Err(BufferError::Callback(-1))));
+        assert!(matches!(res, Err(ProducerError::Callback(-1))));
         assert_eq!(producer.position(), 0);
+    }
+
+    #[test]
+    fn new_rejects_bad_parameters() {
+        assert!(matches!(new(0, 16), Err(BufferError::BadSize(0))));
+        assert!(matches!(new(15, 16), Err(BufferError::BadSize(15))));
+        assert!(matches!(new(16, 15), Err(BufferError::BadAlignment(15))));
     }
 }

@@ -4,14 +4,14 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 use std::{hint, thread};
 
-use bytering::BufferError;
+use bytering::{ConsumerError, ProducerError};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
 fn main() -> io::Result<()> {
-    const DATA_SIZE: usize = 10_000_000_000;
+    const DATA_SIZE: usize = 10 << 30;
 
-    let (mut producer, mut consumer) = bytering::new(4096, 4096);
+    let (mut producer, mut consumer) = bytering::new(4096, 4096).unwrap();
 
     let mut input = DummyInput {
         rng: SmallRng::seed_from_u64(12345),
@@ -43,8 +43,8 @@ fn main() -> io::Result<()> {
                         })
                     })
                     .map_err(|err| match err {
-                        BufferError::Callback(err) => err,
-                        err @ BufferError::InvalidCount { .. } => invalid_count_panic(err),
+                        ProducerError::Callback(err) => err,
+                        err @ ProducerError::InvalidCount { .. } => invalid_count_panic(err),
                     })?;
 
                 if stop {
@@ -69,8 +69,8 @@ fn main() -> io::Result<()> {
                         })
                     })
                     .map_err(|err| match err {
-                        BufferError::Callback(err) => err,
-                        err @ BufferError::InvalidCount { .. } => invalid_count_panic(err),
+                        ConsumerError::Callback(err) => err,
+                        err @ ConsumerError::InvalidCount { .. } => invalid_count_panic(err),
                     })?;
 
                 if consumer.is_empty() && done_check.load(Relaxed) {
@@ -91,7 +91,7 @@ fn main() -> io::Result<()> {
 
 #[cold]
 #[inline(never)]
-fn invalid_count_panic(err: BufferError<io::Error>) -> ! {
+fn invalid_count_panic(err: impl std::fmt::Display) -> ! {
     panic!("{err}");
 }
 

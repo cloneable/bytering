@@ -1,8 +1,8 @@
-# `bytering::Buffer`
+# `bytering`
 
-A simple, lock-free ring buffer for bytes with fixed capacity. It's specialized
-for low latency, vectored reading and writing in blocking and async I/O
-operations.
+A simple, lock-free, SPSC ring buffer for bytes with fixed capacity. It's
+specialized for low latency, vectored reading and writing in blocking and
+async I/O operations. The read and write paths are panic-free.
 
 Similar to `VecDeque` it provides a pair of byte slices mapping the filled space
 of its internal linear space. Unlike `VecDeque` it provides a pair of mutable
@@ -16,7 +16,7 @@ buffer does not offer any advantages.
 ## Usage
 
 ```rust
-let (mut producer, mut consumer) = bytering::new(4096, 4096);
+let (mut producer, mut consumer) = bytering::new(4096, 4096).unwrap();
 
 let r = producer.io_slices(|bufs, _len| {
     let r = input.read_vectored(bufs)?;
@@ -52,6 +52,4 @@ The code contains some unsafe blocks:
 
 * The buffer is split into one producer half and one consumer half after creation.
   Neither half implements `Clone` nor `Sync`.
-* It uses 64-bit counters that never reset. If you plan on pushing exabytes of
-  data between restarts, this buffer is not for you.
 * Its capacity must be a power of 2. This might change.
