@@ -16,7 +16,7 @@ buffer does not offer any advantages.
 ## Usage
 
 ```rust
-let (reader, writer) = bytering::new(4096, 4096);
+let (mut reader, mut writer) = bytering::new(4096, 4096);
 
 let r = reader.io_slices(|bufs, _len| {
     let r = input.read_vectored(bufs)?;

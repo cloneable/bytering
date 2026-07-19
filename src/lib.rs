@@ -80,8 +80,15 @@ struct Buffer {
     data: AlignedData,
 }
 
-// SAFETY: Sync is safe because slices of data are guaranteed to not be aliased.
-// TODO: make data sync, if possible. And switch to `SyncUnsafeCell`.
+// SAFETY: Sync is safe because the slices handed out over `data` are never
+//         aliased: each counter is advanced only through its uniquely owned,
+//         non-`Clone` half (`Reader` for `write`, `Writer` for `read`), the
+//         slice-vending methods take `&mut self` so a half cannot re-enter
+//         them while its slices are live, and the counter protocol keeps the
+//         producer's empty ranges and the consumer's filled ranges disjoint.
+//         A callback's returned count is checked against the offered length
+//         before a counter is advanced, so `read <= write <= read + size`
+//         holds even with a buggy callback.
 unsafe impl Sync for Buffer {}
 
 impl Buffer {
@@ -98,8 +105,9 @@ impl Buffer {
             // TODO: feature gated WouldBlock
         }
 
-        // SAFETY: ranges are guaranteed to not overlap with any ranges
-        //         `synced_write` will use at the same time.
+        // SAFETY: ranges map the empty region only, which is guaranteed to
+        //         not overlap with the filled region `write_fn` uses at the
+        //         same time.
         let bufs = unsafe { self.data.slices_mut(ranges) };
 
         let n = f(bufs, len).map_err(BufferError::Callback)?;
@@ -125,8 +133,9 @@ impl Buffer {
             // TODO: feature gated WouldBlock
         }
 
-        // SAFETY: ranges are guaranteed to not overlap with any ranges
-        //         `synced_read` will use at the same time.
+        // SAFETY: ranges map the filled region only, which is guaranteed to
+        //         not overlap with the empty region `read_fn` uses at the
+        //         same time.
         let bufs = unsafe { self.data.slices(ranges) };
 
         let n = f(bufs, len).map_err(BufferError::Callback)?;
@@ -235,16 +244,15 @@ const fn empty_ranges(
     (ranges, len)
 }
 
+/// Keeps the containing half `Send` while suppressing `Sync`, without an
+/// unsafe impl.
+type SendNotSyncZst = ::core::cell::Cell<()>;
+
 #[derive(Debug)]
 pub struct Reader {
     buffer: Arc<Buffer>,
-    _notsync: PhantomData<*mut ()>,
+    _notsync: PhantomData<SendNotSyncZst>,
 }
-
-// SAFETY: Reader is already Send, but to prevent Sync it contains a PhantomData
-//         field preventing both traits. Until negative trait bounds are allowed
-//         this Send impl is needed.
-unsafe impl Send for Reader {}
 
 impl Reader {
     /// Calls the passed closure with a pair of [`io::IoSliceMut`] meant to be
@@ -260,7 +268,7 @@ impl Reader {
     #[cfg(feature = "std")]
     #[inline]
     pub fn io_slices(
-        &self,
+        &mut self,
         mut f: impl FnMut(&mut [io::IoSliceMut<'_>], usize) -> io::Result<usize>,
     ) -> Result<usize, BufferError<io::Error>> {
         self.buffer.read_fn(|bufs, len| {
@@ -279,7 +287,7 @@ impl Reader {
     /// than the total length it was given.
     #[inline]
     pub fn slices<E>(
-        &self,
+        &mut self,
         mut f: impl FnMut(&mut [&mut [u8]], usize) -> Result<usize, E>,
     ) -> Result<usize, BufferError<E>> {
         self.buffer.read_fn(|mut bufs, len| f(&mut bufs, len))
@@ -316,13 +324,8 @@ impl io::Write for Reader {
 #[derive(Debug)]
 pub struct Writer {
     buffer: Arc<Buffer>,
-    _notsync: PhantomData<*mut ()>,
+    _notsync: PhantomData<SendNotSyncZst>,
 }
-
-// SAFETY: Writer is already Send, but to prevent Sync it contains a PhantomData
-//         field preventing both traits. Until negative trait bounds are allowed
-//         this Send impl is needed.
-unsafe impl Send for Writer {}
 
 impl Writer {
     /// Calls the passed closure with a pair of [`io::IoSlice`] meant to be
@@ -338,7 +341,7 @@ impl Writer {
     #[cfg(feature = "std")]
     #[inline]
     pub fn io_slices(
-        &self,
+        &mut self,
         mut f: impl FnMut(&[io::IoSlice<'_>], usize) -> io::Result<usize>,
     ) -> Result<usize, BufferError<io::Error>> {
         self.buffer.write_fn(|bufs, len| {
@@ -357,7 +360,7 @@ impl Writer {
     /// than the total length it was given.
     #[inline]
     pub fn slices<E>(
-        &self,
+        &mut self,
         mut f: impl FnMut(&[&[u8]], usize) -> Result<usize, E>,
     ) -> Result<usize, BufferError<E>> {
         self.buffer.write_fn(|bufs, len| f(&bufs, len))
@@ -492,6 +495,8 @@ const fn range_len(r: &Range<usize>) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use ::core::cmp::Ord;
+    use ::core::convert::{From as _, TryFrom as _};
     use ::core::marker::{Send, Sized, Sync};
     use ::core::matches;
     use ::static_assertions::{assert_impl_all, assert_not_impl_any};
@@ -610,8 +615,74 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_pattern_across_wraps() {
+        const RING: usize = 16;
+        const TOTAL: usize = 200;
+        const PRODUCE_MAX: usize = 11;
+        const CONSUME_MAX: usize = 7;
+
+        let (mut reader, mut writer) = new(RING, RING);
+
+        let mut produced = 0;
+        let mut consumed = 0;
+
+        while consumed < TOTAL {
+            if produced < TOTAL {
+                let n = reader
+                    .slices(|bufs, len| {
+                        let cap = len.min(PRODUCE_MAX).min(TOTAL - produced);
+                        let mut n = 0;
+                        'bufs: for buf in bufs.iter_mut() {
+                            for b in buf.iter_mut() {
+                                if n == cap {
+                                    break 'bufs;
+                                }
+                                *b = u8::try_from((produced + n) % 251).unwrap();
+                                n += 1;
+                            }
+                        }
+                        Ok::<_, ()>(n)
+                    })
+                    .unwrap();
+                assert!(n > 0, "producer must make progress");
+                produced += n;
+            }
+
+            let n = writer
+                .slices(|bufs, len| {
+                    let cap = len.min(CONSUME_MAX);
+                    let mut n = 0;
+                    'bufs: for buf in bufs {
+                        for &b in *buf {
+                            if n == cap {
+                                break 'bufs;
+                            }
+                            assert_eq!(
+                                usize::from(b),
+                                (consumed + n) % 251,
+                                "byte {}",
+                                consumed + n
+                            );
+                            n += 1;
+                        }
+                    }
+                    Ok::<_, ()>(n)
+                })
+                .unwrap();
+            assert!(n > 0, "consumer must make progress");
+            consumed += n;
+        }
+
+        assert_eq!(produced, TOTAL);
+        assert_eq!(consumed, TOTAL);
+        assert_eq!(reader.position(), TOTAL);
+        assert_eq!(writer.position(), TOTAL);
+        assert!(writer.is_empty());
+    }
+
+    #[test]
     fn reader_invalid_count_errors() {
-        let (reader, _writer) = new(16, 16);
+        let (mut reader, _writer) = new(16, 16);
         let res = reader.slices(|_bufs, len| Ok::<_, ()>(len + 1));
         assert!(matches!(
             res,
@@ -626,7 +697,7 @@ mod tests {
 
     #[test]
     fn writer_invalid_count_errors() {
-        let (reader, writer) = new(16, 16);
+        let (mut reader, mut writer) = new(16, 16);
         reader.slices(|_bufs, _len| Ok::<_, ()>(4)).unwrap();
         let res = writer.slices(|_bufs, len| Ok::<_, ()>(len + 1));
         assert!(matches!(
@@ -642,7 +713,7 @@ mod tests {
 
     #[test]
     fn callback_error_passes_through() {
-        let (reader, _writer) = new(16, 16);
+        let (mut reader, _writer) = new(16, 16);
         let res = reader.slices(|_bufs, _len| Err::<usize, i32>(-1));
         assert!(matches!(res, Err(BufferError::Callback(-1))));
         assert_eq!(reader.position(), 0);

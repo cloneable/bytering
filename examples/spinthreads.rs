@@ -11,7 +11,7 @@ use rand::{Rng, SeedableRng};
 fn main() -> io::Result<()> {
     const DATA_SIZE: usize = 10_000_000_000;
 
-    let (reader, writer) = bytering::new(4096, 4096);
+    let (mut reader, mut writer) = bytering::new(4096, 4096);
 
     let mut input = DummyInput {
         rng: SmallRng::seed_from_u64(12345),
