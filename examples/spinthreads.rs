@@ -11,7 +11,7 @@ use rand::{Rng, SeedableRng};
 fn main() -> io::Result<()> {
     const DATA_SIZE: usize = 10_000_000_000;
 
-    let (mut reader, mut writer) = bytering::new(4096, 4096);
+    let (mut producer, mut consumer) = bytering::new(4096, 4096);
 
     let mut input = DummyInput {
         rng: SmallRng::seed_from_u64(12345),
@@ -24,12 +24,12 @@ fn main() -> io::Result<()> {
     let done = Arc::new(AtomicBool::new(false));
     let done_check = Arc::clone(&done);
 
-    let reader_thread: thread::JoinHandle<io::Result<_>> = thread::Builder::new()
-        .name("reader".into())
+    let producer_thread: thread::JoinHandle<io::Result<_>> = thread::Builder::new()
+        .name("producer".into())
         .spawn(move || {
             loop {
                 let mut stop = false;
-                reader
+                producer
                     .io_slices(|bufs, len| {
                         Ok(if len == 0 {
                             hint::spin_loop();
@@ -49,17 +49,17 @@ fn main() -> io::Result<()> {
 
                 if stop {
                     done.store(true, Relaxed);
-                    assert_eq!(reader.position(), DATA_SIZE);
+                    assert_eq!(producer.position(), DATA_SIZE);
                     return Ok(input);
                 }
             }
         })?;
 
-    let writer_thread: thread::JoinHandle<io::Result<_>> = thread::Builder::new()
-        .name("writer".into())
+    let consumer_thread: thread::JoinHandle<io::Result<_>> = thread::Builder::new()
+        .name("consumer".into())
         .spawn(move || {
             loop {
-                writer
+                consumer
                     .io_slices(|bufs, len| {
                         Ok(if len == 0 {
                             hint::spin_loop();
@@ -73,15 +73,15 @@ fn main() -> io::Result<()> {
                         err @ BufferError::InvalidCount { .. } => invalid_count_panic(err),
                     })?;
 
-                if writer.is_empty() && done_check.load(Relaxed) {
-                    assert_eq!(writer.position(), DATA_SIZE);
+                if consumer.is_empty() && done_check.load(Relaxed) {
+                    assert_eq!(consumer.position(), DATA_SIZE);
                     return Ok(output);
                 }
             }
         })?;
 
-    let input = reader_thread.join().unwrap()?;
-    let output = writer_thread.join().unwrap()?;
+    let input = producer_thread.join().unwrap()?;
+    let output = consumer_thread.join().unwrap()?;
 
     assert_eq!(input.data, 0);
     assert_eq!(output.data, DATA_SIZE);

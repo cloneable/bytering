@@ -16,14 +16,14 @@ buffer does not offer any advantages.
 ## Usage
 
 ```rust
-let (mut reader, mut writer) = bytering::new(4096, 4096);
+let (mut producer, mut consumer) = bytering::new(4096, 4096);
 
-let r = reader.io_slices(|bufs, _len| {
+let r = producer.io_slices(|bufs, _len| {
     let r = input.read_vectored(bufs)?;
     Ok(r)
 })?;
 
-let w = writer.io_slices(|bufs, _len| {
+let w = consumer.io_slices(|bufs, _len| {
     let w = output.write_vectored(bufs)?;
     Ok(w)
 })?;
@@ -31,7 +31,7 @@ let w = writer.io_slices(|bufs, _len| {
 
 ## Locking
 
-The buffer is split into one reader half and one writer half after creation.
+The buffer is split into one producer half and one consumer half after creation.
 Each half controls one atomic counter: either the read counter or the write
 counter. The counters are only ever incremented and the read counter cannot go
 past the write counter and the write counter cannot go further away from the
@@ -50,7 +50,7 @@ The code contains some unsafe blocks:
 
 ## Caveats
 
-* The buffer is split into one reader half and one writer half after creation.
+* The buffer is split into one producer half and one consumer half after creation.
   Neither half implements `Clone` nor `Sync`.
 * It uses 64-bit counters that never reset. If you plan on pushing exabytes of
   data between restarts, this buffer is not for you.

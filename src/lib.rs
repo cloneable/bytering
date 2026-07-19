@@ -34,14 +34,14 @@ use ::crossbeam_utils::CachePadded;
 #[cfg(feature = "std")]
 use ::std::io;
 
-/// Creates a reader-writer pair sharing a ring buffer.
+/// Creates a producer-consumer pair sharing a ring buffer.
 ///
 /// # Panics
 ///
 /// Will panic if `size` or `align` is not a power of 2.
 #[must_use]
 #[inline]
-pub fn new(size: usize, align: usize) -> (Reader, Writer) {
+pub fn new(size: usize, align: usize) -> (Producer, Consumer) {
     assert!(
         size.is_power_of_two(), // implies != 0
         "size is not power of two: {size}"
@@ -59,16 +59,16 @@ pub fn new(size: usize, align: usize) -> (Reader, Writer) {
         data,
     });
 
-    let reader = Reader {
+    let producer = Producer {
         buffer: Arc::clone(&buffer),
         _notsync: PhantomData,
     };
-    let writer = Writer {
+    let consumer = Consumer {
         buffer,
         _notsync: PhantomData,
     };
 
-    (reader, writer)
+    (producer, consumer)
 }
 
 // TODO: put data and counters into same heap allocation.
@@ -82,7 +82,7 @@ struct Buffer {
 
 // SAFETY: Sync is safe because the slices handed out over `data` are never
 //         aliased: each counter is advanced only through its uniquely owned,
-//         non-`Clone` half (`Reader` for `write`, `Writer` for `read`), the
+//         non-`Clone` half (`Producer` for `write`, `Consumer` for `read`), the
 //         slice-vending methods take `&mut self` so a half cannot re-enter
 //         them while its slices are live, and the counter protocol keeps the
 //         producer's empty ranges and the consumer's filled ranges disjoint.
@@ -93,7 +93,7 @@ unsafe impl Sync for Buffer {}
 
 impl Buffer {
     #[inline]
-    fn read_fn<E>(
+    fn produce_fn<E>(
         &self,
         mut f: impl FnMut([&mut [u8]; 2], usize) -> Result<usize, E>,
     ) -> Result<usize, BufferError<E>> {
@@ -106,7 +106,7 @@ impl Buffer {
         }
 
         // SAFETY: ranges map the empty region only, which is guaranteed to
-        //         not overlap with the filled region `write_fn` uses at the
+        //         not overlap with the filled region `consume_fn` uses at the
         //         same time.
         let bufs = unsafe { self.data.slices_mut(ranges) };
 
@@ -121,7 +121,7 @@ impl Buffer {
     }
 
     #[inline]
-    fn write_fn<E>(
+    fn consume_fn<E>(
         &self,
         mut f: impl FnMut([&[u8]; 2], usize) -> Result<usize, E>,
     ) -> Result<usize, BufferError<E>> {
@@ -134,7 +134,7 @@ impl Buffer {
         }
 
         // SAFETY: ranges map the filled region only, which is guaranteed to
-        //         not overlap with the empty region `read_fn` uses at the
+        //         not overlap with the empty region `produce_fn` uses at the
         //         same time.
         let bufs = unsafe { self.data.slices(ranges) };
 
@@ -149,8 +149,8 @@ impl Buffer {
     }
 }
 
-/// The error type returned by the slice-vending methods of [`Reader`] and
-/// [`Writer`].
+/// The error type returned by the slice-vending methods of [`Producer`] and
+/// [`Consumer`].
 #[derive(Debug, Clone)]
 pub enum BufferError<E> {
     /// The callback (the closure or function passed in) failed. Its error
@@ -249,15 +249,16 @@ const fn empty_ranges(
 type SendNotSyncZst = ::core::cell::Cell<()>;
 
 #[derive(Debug)]
-pub struct Reader {
+pub struct Producer {
     buffer: Arc<Buffer>,
     _notsync: PhantomData<SendNotSyncZst>,
 }
 
-impl Reader {
-    /// Calls the passed closure with a pair of [`io::IoSliceMut`] meant to be
-    /// used with [`io::Read::read_vectored`] and async variants and the total
-    /// length of both slices.
+impl Producer {
+    /// Fills the buffer: calls the passed closure with a pair of
+    /// [`io::IoSliceMut`] mapping the empty space, meant to be used with
+    /// [`io::Read::read_vectored`] and async variants, and the total length
+    /// of both slices.
     /// The closure must return the number of bytes read on success.
     ///
     /// # Errors
@@ -271,14 +272,15 @@ impl Reader {
         &mut self,
         mut f: impl FnMut(&mut [io::IoSliceMut<'_>], usize) -> io::Result<usize>,
     ) -> Result<usize, BufferError<io::Error>> {
-        self.buffer.read_fn(|bufs, len| {
+        self.buffer.produce_fn(|bufs, len| {
             let mut bufs = bufs.map(io::IoSliceMut::new);
             f(&mut bufs, len)
         })
     }
 
-    /// Calls the passed closure with a pair of `&mut [u8]` meant to be
-    /// used with non `std::io` vectored read operations.
+    /// Fills the buffer: calls the passed closure with a pair of `&mut [u8]`
+    /// mapping the empty space, meant to be used with non `std::io` vectored
+    /// read operations.
     ///
     /// # Errors
     ///
@@ -290,7 +292,7 @@ impl Reader {
         &mut self,
         mut f: impl FnMut(&mut [&mut [u8]], usize) -> Result<usize, E>,
     ) -> Result<usize, BufferError<E>> {
-        self.buffer.read_fn(|mut bufs, len| f(&mut bufs, len))
+        self.buffer.produce_fn(|mut bufs, len| f(&mut bufs, len))
     }
 
     #[doc(hidden)]
@@ -303,7 +305,7 @@ impl Reader {
 
 // TODO: impl write_vectored
 #[cfg(feature = "std")]
-impl io::Write for Reader {
+impl io::Write for Producer {
     #[inline]
     fn write(&mut self, src: &[u8]) -> io::Result<usize> {
         use io::Read;
@@ -322,15 +324,16 @@ impl io::Write for Reader {
 }
 
 #[derive(Debug)]
-pub struct Writer {
+pub struct Consumer {
     buffer: Arc<Buffer>,
     _notsync: PhantomData<SendNotSyncZst>,
 }
 
-impl Writer {
-    /// Calls the passed closure with a pair of [`io::IoSlice`] meant to be
-    /// used with [`io::Read::write_vectored`] and async variants and the total
-    /// length of both slices.
+impl Consumer {
+    /// Drains the buffer: calls the passed closure with a pair of
+    /// [`io::IoSlice`] mapping the filled space, meant to be used with
+    /// [`io::Write::write_vectored`] and async variants, and the total length
+    /// of both slices.
     /// The closure must return the number of bytes written on success.
     ///
     /// # Errors
@@ -344,14 +347,15 @@ impl Writer {
         &mut self,
         mut f: impl FnMut(&[io::IoSlice<'_>], usize) -> io::Result<usize>,
     ) -> Result<usize, BufferError<io::Error>> {
-        self.buffer.write_fn(|bufs, len| {
+        self.buffer.consume_fn(|bufs, len| {
             let bufs = bufs.map(io::IoSlice::new);
             f(&bufs, len)
         })
     }
 
-    /// Calls the passed closure with a pair of `&[u8]` meant to be
-    /// used with non `std::io` vectored write operations.
+    /// Drains the buffer: calls the passed closure with a pair of `&[u8]`
+    /// mapping the filled space, meant to be used with non `std::io` vectored
+    /// write operations.
     ///
     /// # Errors
     ///
@@ -363,7 +367,7 @@ impl Writer {
         &mut self,
         mut f: impl FnMut(&[&[u8]], usize) -> Result<usize, E>,
     ) -> Result<usize, BufferError<E>> {
-        self.buffer.write_fn(|bufs, len| f(&bufs, len))
+        self.buffer.consume_fn(|bufs, len| f(&bufs, len))
     }
 
     #[doc(hidden)]
@@ -385,7 +389,7 @@ impl Writer {
 
 // TODO: impl write_vectored
 #[cfg(feature = "std")]
-impl io::Read for Writer {
+impl io::Read for Consumer {
     #[inline]
     fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
         use io::Write;
@@ -504,10 +508,10 @@ mod tests {
     use super::*;
 
     assert_impl_all!(Buffer: Send, Sync);
-    assert_impl_all!(Reader: Send);
-    assert_not_impl_any!(Reader: Sync);
-    assert_impl_all!(Writer: Send);
-    assert_not_impl_any!(Writer: Sync);
+    assert_impl_all!(Producer: Send);
+    assert_not_impl_any!(Producer: Sync);
+    assert_impl_all!(Consumer: Send);
+    assert_not_impl_any!(Consumer: Sync);
 
     #[test]
     fn test_filled_ranges() {
@@ -621,23 +625,23 @@ mod tests {
         const PRODUCE_MAX: usize = 11;
         const CONSUME_MAX: usize = 7;
 
-        let (mut reader, mut writer) = new(RING, RING);
+        let (mut producer, mut consumer) = new(RING, RING);
 
-        let mut produced = 0;
-        let mut consumed = 0;
+        let mut written = 0;
+        let mut read = 0;
 
-        while consumed < TOTAL {
-            if produced < TOTAL {
-                let n = reader
+        while read < TOTAL {
+            if written < TOTAL {
+                let n = producer
                     .slices(|bufs, len| {
-                        let cap = len.min(PRODUCE_MAX).min(TOTAL - produced);
+                        let cap = len.min(PRODUCE_MAX).min(TOTAL - written);
                         let mut n = 0;
                         'bufs: for buf in bufs.iter_mut() {
                             for b in buf.iter_mut() {
                                 if n == cap {
                                     break 'bufs;
                                 }
-                                *b = u8::try_from((produced + n) % 251).unwrap();
+                                *b = u8::try_from((written + n) % 251).unwrap();
                                 n += 1;
                             }
                         }
@@ -645,10 +649,10 @@ mod tests {
                     })
                     .unwrap();
                 assert!(n > 0, "producer must make progress");
-                produced += n;
+                written += n;
             }
 
-            let n = writer
+            let n = consumer
                 .slices(|bufs, len| {
                     let cap = len.min(CONSUME_MAX);
                     let mut n = 0;
@@ -657,12 +661,7 @@ mod tests {
                             if n == cap {
                                 break 'bufs;
                             }
-                            assert_eq!(
-                                usize::from(b),
-                                (consumed + n) % 251,
-                                "byte {}",
-                                consumed + n
-                            );
+                            assert_eq!(usize::from(b), (read + n) % 251, "byte {}", read + n);
                             n += 1;
                         }
                     }
@@ -670,52 +669,52 @@ mod tests {
                 })
                 .unwrap();
             assert!(n > 0, "consumer must make progress");
-            consumed += n;
+            read += n;
         }
 
-        assert_eq!(produced, TOTAL);
-        assert_eq!(consumed, TOTAL);
-        assert_eq!(reader.position(), TOTAL);
-        assert_eq!(writer.position(), TOTAL);
-        assert!(writer.is_empty());
+        assert_eq!(written, TOTAL);
+        assert_eq!(read, TOTAL);
+        assert_eq!(producer.position(), TOTAL);
+        assert_eq!(consumer.position(), TOTAL);
+        assert!(consumer.is_empty());
     }
 
     #[test]
-    fn reader_invalid_count_errors() {
-        let (mut reader, _writer) = new(16, 16);
-        let res = reader.slices(|_bufs, len| Ok::<_, ()>(len + 1));
+    fn producer_invalid_count_errors() {
+        let (mut producer, _consumer) = new(16, 16);
+        let res = producer.slices(|_bufs, len| Ok::<_, ()>(len + 1));
         assert!(matches!(
             res,
             Err(BufferError::InvalidCount { n: 17, len: 16 })
         ));
 
         // The invalid count was discarded; the half stays usable.
-        let n = reader.slices(|_bufs, len| Ok::<_, ()>(len)).unwrap();
+        let n = producer.slices(|_bufs, len| Ok::<_, ()>(len)).unwrap();
         assert_eq!(n, 16);
-        assert_eq!(reader.position(), 16);
+        assert_eq!(producer.position(), 16);
     }
 
     #[test]
-    fn writer_invalid_count_errors() {
-        let (mut reader, mut writer) = new(16, 16);
-        reader.slices(|_bufs, _len| Ok::<_, ()>(4)).unwrap();
-        let res = writer.slices(|_bufs, len| Ok::<_, ()>(len + 1));
+    fn consumer_invalid_count_errors() {
+        let (mut producer, mut consumer) = new(16, 16);
+        producer.slices(|_bufs, _len| Ok::<_, ()>(4)).unwrap();
+        let res = consumer.slices(|_bufs, len| Ok::<_, ()>(len + 1));
         assert!(matches!(
             res,
             Err(BufferError::InvalidCount { n: 5, len: 4 })
         ));
 
         // The invalid count was discarded; the half stays usable.
-        let n = writer.slices(|_bufs, len| Ok::<_, ()>(len)).unwrap();
+        let n = consumer.slices(|_bufs, len| Ok::<_, ()>(len)).unwrap();
         assert_eq!(n, 4);
-        assert_eq!(writer.position(), 4);
+        assert_eq!(consumer.position(), 4);
     }
 
     #[test]
     fn callback_error_passes_through() {
-        let (mut reader, _writer) = new(16, 16);
-        let res = reader.slices(|_bufs, _len| Err::<usize, i32>(-1));
+        let (mut producer, _consumer) = new(16, 16);
+        let res = producer.slices(|_bufs, _len| Err::<usize, i32>(-1));
         assert!(matches!(res, Err(BufferError::Callback(-1))));
-        assert_eq!(reader.position(), 0);
+        assert_eq!(producer.position(), 0);
     }
 }
