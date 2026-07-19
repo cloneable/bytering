@@ -73,7 +73,9 @@ pub fn new(size: usize, align: usize) -> Result<(Producer, Consumer), BufferErro
     Ok((producer, consumer))
 }
 
-// TODO: put data and counters into same heap allocation.
+// TODO: put data and counters into same heap allocation. This would also
+//       remove the `Arc` allocation and with it the only remaining abort
+//       path: `Arc::new` calls `handle_alloc_error` when out of memory.
 #[derive(Debug)]
 struct Buffer {
     read: CachePadded<AtomicUsize>,
